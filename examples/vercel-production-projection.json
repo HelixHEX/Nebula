@@ -1,0 +1,32 @@
+{
+  "repository": "acme/app",
+  "environment": "production",
+  "integrationActor": "integration:vercel",
+  "projectionTarget": "vercel",
+  "rules": [
+    {
+      "path": ".env.production",
+      "action": "inject_secret",
+      "decision": "allow",
+      "delivery": "environment_variable"
+    },
+    {
+      "path": ".env.production",
+      "action": "export_git",
+      "decision": "block",
+      "reason": "production secrets must not enter Git history"
+    },
+    {
+      "path": "packages/proprietary-engine/**",
+      "action": "read_build_source",
+      "decision": "allow",
+      "delivery": "deployment_projection"
+    },
+    {
+      "path": "packages/proprietary-engine/**",
+      "action": "export_git",
+      "decision": "block",
+      "reason": "private build source is available only to deployment projections"
+    }
+  ]
+}

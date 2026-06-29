@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+
+# Local Nebula repositories and exported bundles
+.nebula/
+*.nebula.json
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Local databases and object-store scratch data
+*.db
+*.sqlite
+*.sqlite3
+/data/
+/tmp/
+/scratch/
+
+# Generated reports and load-test artifacts
+coverage/
+lcov.info
+*.profraw
+*.profdata
+tests/load/results/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

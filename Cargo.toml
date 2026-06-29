@@ -1,0 +1,72 @@
+[workspace]
+members = [
+  "crates/nebula-core",
+  "crates/nebula-auth",
+  "crates/nebula-policy",
+  "crates/nebula-sync",
+  "crates/nebula-registry",
+  "crates/nebula-registry-server",
+  "crates/nebula-build",
+  "crates/nebula-storage",
+  "crates/nebula-cli",
+  "crates/nebula-fs",
+  "crates/nebula-git",
+  "crates/nebula-local",
+  "crates/nebula-vector",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/astracollab/nebula"
+homepage = "https://astracollab.com"
+rust-version = "1.89"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+better-auth = { version = "0.10", default-features = false, features = ["axum", "sqlx-postgres", "rustls"] }
+clap = { version = "4", features = ["derive"] }
+cedar-policy = "4"
+futures = "0.3"
+globset = "0.4"
+hex = "0.4"
+bytes = "1"
+schemars = { version = "1", features = ["uuid1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json", "uuid", "migrate", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "request-id", "timeout", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+object_store = { version = "0.12", features = ["aws"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+url = "2"
+jsonwebtoken = "9"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

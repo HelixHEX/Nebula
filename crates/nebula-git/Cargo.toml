@@ -1,0 +1,17 @@
+[package]
+name = "nebula-git"
+version = "0.1.0"
+description = "Experimental Git migration and projection planning for Nebula repositories."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["nebula", "git", "migration"]
+categories = ["development-tools"]
+publish = false
+
+[dependencies]
+nebula-core = { path = "../nebula-core" }
+serde.workspace = true

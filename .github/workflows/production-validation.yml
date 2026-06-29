@@ -1,0 +1,66 @@
+name: Production Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_load_tests:
+        description: "Run k6 load tests"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 9 * * 1"
+
+concurrency:
+  group: production-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fast-production-validation:
+    name: Fast production validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Run fast validation
+        env:
+          NEBULA_TEST_PROFILE: fast
+        run: ./tests/production/validate-production.sh
+
+  load-tests:
+    name: Load tests
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_load_tests }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          curl -fsSL https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install -y k6
+
+      - name: Run validation with load tests
+        env:
+          NEBULA_TEST_PROFILE: fast
+          NEBULA_RUN_LOAD_TESTS: "1"
+        run: ./tests/production/validate-production.sh

@@ -1,0 +1,18 @@
+[package]
+name = "nebula-vector"
+version = "0.1.0"
+description = "Experimental vector index contracts and in-memory search helpers for Nebula snapshots."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["nebula", "vector", "search"]
+categories = ["development-tools"]
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+nebula-core = { path = "../nebula-core" }
+serde.workspace = true

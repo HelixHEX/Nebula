@@ -1,0 +1,21 @@
+[profile.default]
+retries = 0
+failure-output = "immediate-final"
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+[profile.fast]
+default-filter = "not test(/production|chaos|load|container/i)"
+retries = 0
+failure-output = "immediate-final"
+
+[profile.production]
+default-filter = "all()"
+retries = 1
+failure-output = "immediate-final"
+slow-timeout = { period = "90s", terminate-after = 3 }
+
+[profile.chaos]
+default-filter = "test(/chaos|concurrent|idempotency|cas|sync|vector|receiver/i)"
+retries = 0
+failure-output = "immediate-final"
+slow-timeout = { period = "120s", terminate-after = 2 }

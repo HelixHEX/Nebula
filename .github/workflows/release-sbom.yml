@@ -1,0 +1,43 @@
+name: Release SBOM
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-binary-sbom:
+    name: Linux binary SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - name: Install dist
+        shell: bash
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+
+      - name: Build Linux release artifacts
+        run: dist build --artifacts=local --target x86_64-unknown-linux-gnu --tag=${{ github.event.release.tag_name }}
+
+      - name: Generate Linux binary SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: target/distrib
+          output-file: nebula-linux-binaries.spdx.json
+          format: spdx-json
+
+      - name: Attach SBOM to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: nebula-linux-binaries.spdx.json

@@ -1,0 +1,23 @@
+[package]
+name = "nebula-build"
+version = "0.1.0"
+description = "Experimental build-source and deployment projection contracts for Nebula."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["nebula", "build", "deploy"]
+categories = ["development-tools"]
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+nebula-core = { path = "../nebula-core" }
+nebula-git = { path = "../nebula-git" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

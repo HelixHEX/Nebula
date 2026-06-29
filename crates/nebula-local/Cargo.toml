@@ -1,0 +1,19 @@
+[package]
+name = "nebula-local"
+version = "0.1.0"
+description = "Local repository storage and workflow implementation for the Nebula CLI."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["nebula", "local", "cli"]
+categories = ["development-tools"]
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+nebula-core = { path = "../nebula-core" }
+serde.workspace = true
+serde_json.workspace = true

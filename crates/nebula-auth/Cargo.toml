@@ -1,0 +1,22 @@
+[package]
+name = "nebula-auth"
+version = "0.1.0"
+description = "Authentication and token verification helpers for the Nebula registry."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["nebula", "auth", "jwks"]
+categories = ["authentication", "development-tools"]
+publish = false
+
+[dependencies]
+jsonwebtoken.workspace = true
+nebula-core = { path = "../nebula-core" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

@@ -1,0 +1,36 @@
+[package]
+name = "nebula-registry"
+version = "0.1.0"
+description = "Experimental HTTP registry contracts and routes for Nebula source-control data."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["nebula", "registry", "api"]
+categories = ["development-tools", "web-programming"]
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+flate2 = "1.1.9"
+futures.workspace = true
+hex.workspace = true
+nebula-auth = { path = "../nebula-auth" }
+nebula-core = { path = "../nebula-core" }
+nebula-git = { path = "../nebula-git" }
+nebula-policy = { path = "../nebula-policy" }
+nebula-storage = { path = "../nebula-storage" }
+reqwest.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar = "0.4.46"
+tokio.workspace = true
+tokio-util.workspace = true
+tower = "0.5"
+tracing.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "nebula-policy"
+version = "0.1.0"
+description = "Policy evaluation and Cedar integration for Nebula source-control operations."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["nebula", "policy", "cedar"]
+categories = ["development-tools"]
+publish = false
+
+[dependencies]
+cedar-policy.workspace = true
+nebula-core = { path = "../nebula-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

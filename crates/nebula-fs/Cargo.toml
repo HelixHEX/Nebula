@@ -1,0 +1,18 @@
+[package]
+name = "nebula-fs"
+version = "0.1.0"
+description = "Snapshot-backed filesystem overlay primitives for Nebula workspaces."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["nebula", "filesystem", "overlay"]
+categories = ["filesystem", "development-tools"]
+publish = false
+
+[dependencies]
+nebula-core = { path = "../nebula-core" }
+serde.workspace = true
+thiserror.workspace = true

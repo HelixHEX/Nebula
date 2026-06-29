@@ -1,0 +1,26 @@
+ARG RUST_VERSION=1.89
+FROM rust:${RUST_VERSION}-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p nebula-registry-server
+
+FROM debian:bookworm-slim AS runtime
+LABEL org.opencontainers.image.title="Nebula Registry Server" \
+  org.opencontainers.image.description="Pre-alpha Nebula source-control registry server" \
+  org.opencontainers.image.source="https://github.com/astracollab/nebula" \
+  org.opencontainers.image.licenses="Apache-2.0"
+RUN useradd --create-home --uid 10001 nebula \
+  && apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates wget \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/nebula-registry-server /usr/local/bin/nebula-registry-server
+USER nebula
+ENV HOST=0.0.0.0
+ENV PORT=8080
+ENV NEBULA_ADMIN_API_ENABLED=false
+ENV NEBULA_ADMIN_REQUIRE_BETTER_AUTH=true
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["/bin/sh", "-c", "wget -qO- http://127.0.0.1:${PORT}/health/live >/dev/null || exit 1"]
+CMD ["nebula-registry-server"]
