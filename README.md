@@ -34,6 +34,47 @@ nebula/
   tests/
 ```
 
+## Core Concepts
+
+### Galactic Registry Model
+Nebula organizes work at three levels:
+- **Galaxy** — A logical registry/project (e.g., "my-app")
+- **Workspace** — A branch-like working copy with snapshots (status: `capturing` | `merged`)
+- **Snapshot** — Immutable content-addressed tree state (commit equivalent)
+
+### Change Flow
+1. **Capture** — `neb save` creates a workspace + snapshot + changeset
+2. **Propose** — Bundle changesets into a proposal for review
+3. **Review** — Approvals, checks, release gates, comments
+4. **Merge** — Three-way merge or fast-forward into target workspace
+5. **Project** — Deploy via projections (Horizon, Vercel, etc.)
+
+### Workspaces as Branches
+Unlike Git branches, workspaces are first-class registry objects:
+- Multiple workspaces per galaxy (feature branches)
+- Each tracks `baseSnapshotId` (fork point) and `latestSnapshotId` (tip)
+- `status: "merged"` marks the main branch
+- Merge targets any workspace via `targetWorkspaceId`
+
+### Proposals
+Structured PR equivalent:
+- Bundles 1+ changesets
+- Policy-gated (Cedar policies per path)
+- Review states: open → approved → merged/closed
+- Checks and release gates as merge prerequisites
+
+### Policies
+Cedar-based, path-scoped:
+- `allow`/`deny`/`review_required`/`embargo` per actor/action/path
+- Environment-scoped (dev/staging/prod)
+- Release gates: immediate | delayed_until | embargoed (+ optional required approver)
+
+### Projections & Deployments
+Projections map snapshots → deployment targets:
+- Define `includedPaths`, environment, provider (Horizon/Vercel)
+- Generate deployment intents on proposal merge
+- Vector manifests for semantic search/indexing
+
 ## Build From Source
 
 There are no published binary installers yet (see `docs/support-matrix.md`) —
@@ -41,7 +82,6 @@ There are no published binary installers yet (see `docs/support-matrix.md`) —
 only supported install path today is building from source.
 
 Requirements:
-
 - Rust 1.89 or newer
 - Postgres and object storage only for registry production-path validation
 - k6 only for load tests
@@ -60,7 +100,6 @@ Make sure that directory is on your shell's `PATH` (the standard Rust
 installer via https://rustup.rs adds it automatically).
 
 Verify it worked:
-
 ```bash
 neb --help
 ```
@@ -88,7 +127,7 @@ neb proposal status <proposal-id>
 neb merge <proposal-id>
 ```
 
-Use local bundle remotes for today’s sync experiments:
+Use local bundle remotes for today's sync experiments:
 
 ```bash
 neb remote add origin file:///tmp/acme-app.nebula.json
@@ -119,7 +158,6 @@ NEBULA_TEST_PROFILE=fast ./tests/production/validate-production.sh
 ```
 
 See:
-
 - `docs/production-registry.md`
 - `docs/production-sprint-runbook.md`
 - `docs/release-checklist.md`
