@@ -1,15 +1,20 @@
+use aes_gcm::{
+    Aes256Gcm, KeyInit, Nonce,
+    aead::{Aead, Payload},
+};
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::Query,
+    extract::{Extension, Query},
     extract::{Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
-    routing::{any, get, post, put},
+    routing::{any, delete, get, post, put},
 };
 use flate2::{Compression, write::GzEncoder};
 use futures::{StreamExt, stream};
+use hmac::{Hmac, Mac};
 use nebula_auth::{AuthContext, JwksVerifier};
 use nebula_core::*;
 use nebula_policy::{
@@ -24,6 +29,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Write,
     path::PathBuf,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -32,9 +38,17 @@ use tar::{Builder as TarBuilder, Header as TarHeader};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
+mod import;
+pub use import::{ImportFileOptions, ImportFileReport, import_persisted_registry};
+
 const DEFAULT_AUTH_TOKEN_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 const MAX_AUTH_TOKEN_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1_000;
-const EXTERNAL_AUTH_CACHE_TTL_MS: u64 = 10 * 60 * 1_000;
+// Revocation (`neb auth token revoke`) goes straight to the external auth
+// provider (Better Auth) and has no hook into this cache, so this TTL is a
+// hard upper bound on how long a revoked token keeps working here. Kept
+// short (not the request-scoped duration a single sync session could use)
+// so revocation reads as "took effect", not "still works for 10 minutes".
+const EXTERNAL_AUTH_CACHE_TTL_MS: u64 = 30 * 1_000;
 const DIRECT_UPLOAD_URL_TTL_SECONDS: u64 = 15 * 60;
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
@@ -56,6 +70,7 @@ pub struct RegistryConfig {
     pub telemetry_event_file: Option<PathBuf>,
     pub telemetry_webhook_url: Option<String>,
     pub telemetry_webhook_secret: Option<String>,
+    pub secret_encryption_key: Option<String>,
     pub bootstrap_auth_tokens: Vec<RegistryBootstrapAuthToken>,
 }
 
@@ -92,6 +107,7 @@ impl Default for RegistryConfig {
             telemetry_event_file: None,
             telemetry_webhook_url: None,
             telemetry_webhook_secret: None,
+            secret_encryption_key: None,
             bootstrap_auth_tokens: Vec::new(),
         }
     }
@@ -205,6 +221,32 @@ async fn auth_middleware(
     };
 
     let route_repository_id = route_repository_id(request.uri().path());
+
+    // Tries the JWKS verifier (if configured), then falls back to a stored
+    // API token (bootstrap tokens or a durably-persisted token). Extracted
+    // so both the external-auth-provider path below and the no-external-
+    // provider path can share it: a bearer token might be *either* kind
+    // (e.g. hive-registry runs both a better-auth-rs bridge for its own
+    // service tokens AND a JWKS verifier for an external identity provider's
+    // end-user tokens — a single `auth_provider` setting used to force an
+    // exclusive choice between the two, which broke whichever one wasn't
+    // selected).
+    async fn verify_via_jwks_or_stored(
+        state: &AppState,
+        token: &str,
+        route_repository_id: Option<&RepositoryId>,
+    ) -> Result<VerifiedClaims, String> {
+        if let Some(verifier) = &state.auth.verifier
+            && let Ok(context) = verifier.verify_token(token).await
+        {
+            return Ok(context.into());
+        }
+        if matches!(state.auth.token_authority, AuthTokenAuthority::AstracollabHosted) {
+            return Err("hosted Nebula requires configured external auth tokens".to_string());
+        }
+        verify_stored_api_token(state, token, route_repository_id)
+    }
+
     let verified: VerifiedClaims = if let Some(provider) = &state.external_auth_provider {
         let auth_cache_key = external_auth_cache_key(token, route_repository_id.as_ref());
         let cached = state
@@ -233,47 +275,21 @@ async fn auth_middleware(
                     }
                     claims
                 }
-                Err(error) => {
-                    return (StatusCode::UNAUTHORIZED, Json(json!({ "error": error })))
-                        .into_response();
-                }
-            }
-        }
-    } else if let Some(verifier) = &state.auth.verifier {
-        match verifier.verify_token(token).await {
-            Ok(context) => context.into(),
-            Err(_) => {
-                if matches!(
-                    state.auth.token_authority,
-                    AuthTokenAuthority::AstracollabHosted
-                ) {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(json!({ "error": "hosted Nebula requires configured external auth tokens" })),
-                    )
-                        .into_response();
-                }
-                match verify_stored_api_token(&state, token, route_repository_id.as_ref()) {
-                    Ok(claims) => claims,
-                    Err(error) => {
-                        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": error })))
-                            .into_response();
+                Err(_) => {
+                    match verify_via_jwks_or_stored(&state, token, route_repository_id.as_ref())
+                        .await
+                    {
+                        Ok(claims) => claims,
+                        Err(error) => {
+                            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": error })))
+                                .into_response();
+                        }
                     }
                 }
             }
         }
     } else {
-        if matches!(
-            state.auth.token_authority,
-            AuthTokenAuthority::AstracollabHosted
-        ) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "hosted Nebula requires external authentication" })),
-            )
-                .into_response();
-        }
-        match verify_stored_api_token(&state, token, route_repository_id.as_ref()) {
+        match verify_via_jwks_or_stored(&state, token, route_repository_id.as_ref()).await {
             Ok(claims) => claims,
             Err(error) => {
                 return (StatusCode::UNAUTHORIZED, Json(json!({ "error": error }))).into_response();
@@ -286,20 +302,18 @@ async fn auth_middleware(
         if let (Some(repository_id), Some(route)) = (
             route_repository_id.as_ref(),
             route_metadata(request.method(), request.uri().path()),
-        ) {
-            if let Err(error) = record_denied_authorization_audit(
-                &state,
-                &verified,
-                repository_id,
-                route.action.clone(),
-                route.resource_kind,
-                request.uri().path().to_string(),
-                error.clone(),
-            )
-            .await
-            {
-                return error.into_response();
-            }
+        ) && let Err(error) = record_denied_authorization_audit(
+            &state,
+            &verified,
+            repository_id,
+            route.action.clone(),
+            route.resource_kind,
+            request.uri().path().to_string(),
+            error.clone(),
+        )
+        .await
+        {
+            return error.into_response();
         }
         return (StatusCode::FORBIDDEN, Json(json!({ "error": error }))).into_response();
     }
@@ -308,24 +322,46 @@ async fn auth_middleware(
         if !verified.scopes.contains(&required_scope)
             && !verified.scopes.contains(&PolicyAction::ManageAuth)
         {
-            if let Some(repository_id) = route_repository_id.as_ref() {
-                if let Err(error) = record_denied_authorization_audit(
+            if let Some(repository_id) = route_repository_id.as_ref()
+                && let Err(error) = record_denied_authorization_audit(
                     &state,
                     &verified,
                     repository_id,
-                    required_scope,
+                    required_scope.clone(),
                     route.resource_kind,
                     request.uri().path().to_string(),
                     "token scope does not allow this registry action".to_string(),
                 )
                 .await
-                {
-                    return error.into_response();
-                }
+            {
+                return error.into_response();
             }
+            let required_scope_str = policy_action_scope_str(&required_scope);
+            let repo_flag = route_repository_id
+                .as_ref()
+                .map(|id| format!(" --repository {id}"))
+                .unwrap_or_default();
+            let hint = if required_scope == PolicyAction::ManageAuth {
+                "manage_auth bypasses per-repository policy checks, so it's never \
+                 self-issuable via `neb auth token create` (on registries using \
+                 Nebula-owned tokens this is enforced server-side; on Better Auth \
+                 deployments it depends on your account's own Better Auth \
+                 permissions, not this registry). Use `neb auth login` with an \
+                 existing credential that already carries it, or ask an admin to \
+                 grant your account access."
+                    .to_string()
+            } else {
+                format!(
+                    "this token doesn't have the '{required_scope_str}' scope; mint one with: neb auth token create <name>{repo_flag} --scope nebula.repository:{required_scope_str}"
+                )
+            };
             return (
                 StatusCode::FORBIDDEN,
-                Json(json!({ "error": "token scope does not allow this registry action" })),
+                Json(json!({
+                    "error": "token scope does not allow this registry action",
+                    "required_scope": required_scope_str,
+                    "hint": hint,
+                })),
             )
                 .into_response();
         }
@@ -360,6 +396,7 @@ async fn auth_middleware(
             let authorizer = CedarNebulaAuthorizer::with_cedar_documents(policies, cedar_documents);
             let authorization_request = AuthorizationRequest {
                 actor: verified.actor.clone(),
+                token_id: verified.token_id.clone(),
                 action: required_scope,
                 repository_id: repository_id.clone(),
                 resource_kind: route.resource_kind.to_string(),
@@ -368,10 +405,10 @@ async fn auth_middleware(
                 environment: None,
             };
             let authorization_result = authorizer.authorize(authorization_request.clone());
-            if let Ok(audit) = &authorization_result {
-                if let Err(error) = record_authorization_audit(&state, audit).await {
-                    return error.into_response();
-                }
+            if let Ok(audit) = &authorization_result
+                && let Err(error) = record_authorization_audit(&state, audit).await
+            {
+                return error.into_response();
             }
             if authorization_result.is_err() && !verified.scopes.contains(&PolicyAction::ManageAuth)
             {
@@ -410,9 +447,32 @@ async fn auth_middleware(
                         attributes,
                     ),
                 );
+                let action_str = policy_action_scope_str(&audit.action);
+                let actor_str = actor_cli_spec(&audit.actor);
+                let token_flag = authorization_request
+                    .token_id
+                    .as_ref()
+                    .map(|token_id| format!(" --token {token_id}"))
+                    .unwrap_or_default();
+                let hint = format!(
+                    "no policy allows {actor_str} to {action_str} on {}; grant it with: neb galaxy policy grant {} {actor_str} --action {action_str}{token_flag}",
+                    audit.repository_id, audit.repository_id
+                );
+                let hint = if token_flag.is_empty() {
+                    hint
+                } else {
+                    format!(
+                        "{hint} (add {token_flag} to scope this grant to just this token; omit it to grant the whole account)"
+                    )
+                };
                 return (
                     StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "policy denied this registry action" })),
+                    Json(json!({
+                        "error": "policy denied this registry action",
+                        "actor": actor_str,
+                        "required_action": action_str,
+                        "hint": hint,
+                    })),
                 )
                     .into_response();
             }
@@ -426,6 +486,33 @@ async fn auth_middleware(
     }
     request.extensions_mut().insert(verified);
     next.run(request).await
+}
+
+/// Converts a `PolicyAction` variant (e.g. `ManageDeployConfig`) into the
+/// snake_case scope string used on the wire and in `--scope`/`--action`
+/// flags (e.g. "manage_deploy_config"), for building actionable error hints.
+fn policy_action_scope_str(action: &PolicyAction) -> String {
+    let debug = format!("{action:?}");
+    let mut result = String::new();
+    for (index, ch) in debug.chars().enumerate() {
+        if ch.is_uppercase() && index > 0 {
+            result.push('_');
+        }
+        result.extend(ch.to_lowercase());
+    }
+    result
+}
+
+/// Formats an `Actor` as the CLI's "<kind>:<id>" spec (or "public"), so it
+/// can be pasted directly into `neb galaxy policy grant`.
+fn actor_cli_spec(actor: &Actor) -> String {
+    match actor {
+        Actor::User(id) => format!("user:{id}"),
+        Actor::Team(id) => format!("team:{id}"),
+        Actor::Agent(id) => format!("agent:{id}"),
+        Actor::Integration(id) => format!("integration:{id}"),
+        Actor::Public => "public".to_string(),
+    }
 }
 
 fn route_repository_id(path: &str) -> Option<RepositoryId> {
@@ -475,10 +562,9 @@ fn verify_stored_api_token(
     }
     if let (Some(route_repository_id), Some(token_repository_id)) =
         (route_repository_id, token.repository_id.as_ref())
+        && route_repository_id != token_repository_id
     {
-        if route_repository_id != token_repository_id {
-            return Err("bearer token is not scoped to this repository".to_string());
-        }
+        return Err("bearer token is not scoped to this repository".to_string());
     }
     Ok(VerifiedClaims {
         actor: token.actor.clone(),
@@ -509,14 +595,13 @@ fn ensure_claims_bound_to_route(
             .registry
             .read()
             .map_err(|_| "registry lock poisoned".to_string())?;
-        if let Some(repository) = registry.repositories.get(route_repository_id) {
-            if repository
+        if let Some(repository) = registry.repositories.get(route_repository_id)
+            && repository
                 .org_id
                 .as_ref()
                 .is_some_and(|repository_org_id| repository_org_id != claim_org_id)
-            {
-                return Err("bearer token organization claim does not match repository".to_string());
-            }
+        {
+            return Err("bearer token organization claim does not match repository".to_string());
         }
     }
     Ok(())
@@ -544,6 +629,7 @@ fn route_metadata(method: &Method, path: &str) -> Option<RouteMetadata> {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
     let action = match segments.as_slice() {
+        ["v1", "galaxies"] if method == Method::GET => PolicyAction::ReadBlob,
         ["v1", "galaxies"] => PolicyAction::ManageAuth,
         ["v1", "galaxies", "by-name", _, _] => PolicyAction::ReadBlob,
         ["v1", "galaxies", _] => PolicyAction::ReadBlob,
@@ -572,11 +658,43 @@ fn route_metadata(method: &Method, path: &str) -> Option<RouteMetadata> {
         | ["v1", "galaxies", _, "deploy-intents"]
         | ["v1", "galaxies", _, "deploy-intents", _, "status"]
         | ["v1", "galaxies", _, "release-gates"] => PolicyAction::Deploy,
+        ["v1", "galaxies", _, "environments", _, "variables"] if method == Method::GET => {
+            PolicyAction::ReadVariableMetadata
+        }
+        ["v1", "galaxies", _, "environments", _, "variables"] => PolicyAction::ManageVariables,
+        [
+            "v1",
+            "galaxies",
+            _,
+            "environments",
+            _,
+            "variables",
+            "inject",
+        ] => PolicyAction::InjectVariable,
+        [
+            "v1",
+            "galaxies",
+            _,
+            "environments",
+            _,
+            "variables",
+            _,
+            "export",
+        ] => PolicyAction::ExportSecret,
+        ["v1", "galaxies", _, "environments"] if method == Method::GET => {
+            PolicyAction::ReadBuildSource
+        }
         ["v1", "galaxies", _, "policies"]
+        | ["v1", "galaxies", _, "policies", _]
         | ["v1", "galaxies", _, "cedar-policies"]
         | ["v1", "galaxies", _, "integrations"]
-        | ["v1", "galaxies", _, "environments"]
-        | ["v1", "galaxies", _, "deploy-config"] => PolicyAction::ManageAuth,
+        | ["v1", "galaxies", _, "environments"] => PolicyAction::ManageAuth,
+        // Deploy-config registration (pointing a service's deploy-intent
+        // webhook at e.g. Horizon) is a narrower, self-service-friendly
+        // action than the other admin routes above: it doesn't need the
+        // ManageAuth bypass scope, which self-issued tokens are deliberately
+        // not allowed to hold.
+        ["v1", "galaxies", _, "deploy-configs", ..] => PolicyAction::ManageDeployConfig,
         ["v1", "galaxies", _, "merge-intents"] => PolicyAction::MergeChangeSet,
         ["v1", "galaxies", _, "refs", ..] => PolicyAction::MergeChangeSet,
         ["v1", "galaxies", _, "proposals"] | ["v1", "galaxies", _, "proposals", _] => {
@@ -605,6 +723,8 @@ fn route_resource_kind_without_metadata(path: &str) -> &'static str {
         "Webhook"
     } else if path.contains("/sync-sessions") || path.contains("/sync-bundle") {
         "SyncSession"
+    } else if path.contains("/variables") {
+        "EnvironmentVariable"
     } else if path.contains("/release-gates") {
         "ReleaseGate"
     } else if path.contains("/deploy-intents") {
@@ -639,11 +759,8 @@ fn route_resource_kind_without_metadata(path: &str) -> &'static str {
 }
 
 pub fn router(config: RegistryConfig) -> Router {
-    let registry = config
-        .persistence_path
-        .as_ref()
-        .and_then(|path| InMemoryRegistry::load_from_path(path).ok())
-        .unwrap_or_default();
+    let registry = load_registry_from_persistence(config.persistence_path.as_ref())
+        .unwrap_or_else(|error| panic!("{error}"));
     router_with_state(config, registry)
 }
 
@@ -655,11 +772,7 @@ pub async fn router_async_with_auth_provider(
     config: RegistryConfig,
     external_auth_provider: Option<Arc<dyn RegistryAuthProvider>>,
 ) -> Result<Router, String> {
-    let mut registry = config
-        .persistence_path
-        .as_ref()
-        .and_then(|path| InMemoryRegistry::load_from_path(path).ok())
-        .unwrap_or_default();
+    let mut registry = load_registry_from_persistence(config.persistence_path.as_ref())?;
     let durable_store = match &config.postgres_url {
         Some(url) => Some(Arc::new(
             PostgresMetadataStore::connect(url)
@@ -734,6 +847,7 @@ fn router_with_backend(
         telemetry_event_file: config.telemetry_event_file.clone(),
         telemetry_webhook_url: config.telemetry_webhook_url.clone(),
         telemetry_webhook_secret: config.telemetry_webhook_secret.clone(),
+        secret_encryption_key: config.secret_encryption_key.clone(),
         http_client: reqwest::Client::new(),
     };
 
@@ -757,11 +871,12 @@ fn router_with_backend(
         .route("/v2/{*path}", any(oci_dispatch))
         .route("/v1/protocol", get(protocol))
         .route("/v1/schema", get(schema))
+        .route("/v1/whoami", get(whoami))
         .route(
             "/v1/deploy-archives/{repository_id}/{intent_id}",
             get(get_deploy_archive),
         )
-        .route("/v1/galaxies", post(create_repository))
+        .route("/v1/galaxies", get(list_galaxies).post(create_repository))
         .route("/v1/galaxies/{repository_id}", get(get_repository))
         .route(
             "/v1/galaxies/by-name/{owner}/{name}",
@@ -815,14 +930,33 @@ fn router_with_backend(
             "/v1/galaxies/{repository_id}/proposals/{proposal_id}",
             get(get_proposal),
         )
-        .route("/v1/galaxies/{repository_id}/policies", put(put_policy))
+        .route(
+            "/v1/galaxies/{repository_id}/policies",
+            get(list_policies).put(put_policy),
+        )
+        .route(
+            "/v1/galaxies/{repository_id}/policies/{policy_id}",
+            delete(delete_policy),
+        )
         .route(
             "/v1/galaxies/{repository_id}/cedar-policies",
             put(put_cedar_policy_document),
         )
         .route(
             "/v1/galaxies/{repository_id}/environments",
-            put(put_environment),
+            get(list_environments).put(put_environment),
+        )
+        .route(
+            "/v1/galaxies/{repository_id}/environments/{environment_id}/variables",
+            get(list_environment_variables).put(upsert_environment_variable),
+        )
+        .route(
+            "/v1/galaxies/{repository_id}/environments/{environment_id}/variables/inject",
+            post(inject_environment_variables),
+        )
+        .route(
+            "/v1/galaxies/{repository_id}/environments/{environment_id}/variables/{variable_id}/export",
+            post(export_environment_variable),
         )
         .route(
             "/v1/galaxies/{repository_id}/integrations",
@@ -869,8 +1003,10 @@ fn router_with_backend(
             put(put_deployment_grant),
         )
         .route(
-            "/v1/galaxies/{repository_id}/deploy-config",
-            get(get_deploy_config).put(put_deploy_config),
+            "/v1/galaxies/{repository_id}/deploy-configs/{*service_id}",
+            get(get_deploy_config)
+                .put(put_deploy_config)
+                .delete(delete_deploy_config),
         )
         .route(
             "/v1/galaxies/{repository_id}/deploy-intents",
@@ -977,6 +1113,36 @@ async fn protocol() -> Json<RegistryProtocol> {
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct WhoAmIResponse {
+    pub actor: Actor,
+    pub org_id: Option<String>,
+    pub repository_id: Option<RepositoryId>,
+    pub token_id: Option<AuthTokenId>,
+    pub scopes: Vec<PolicyAction>,
+    /// True if this identity's scopes bypass per-repository policy checks
+    /// (see `ManageAuth`). Useful for telling whether `neb galaxy policy
+    /// grant` is even necessary for this identity to act.
+    pub bypasses_policy_checks: bool,
+}
+
+/// Returns the caller's own resolved identity: which `Actor` their bearer
+/// token maps to, and what scopes/repository binding it carries. Exists so
+/// `neb galaxy policy grant` doesn't require guessing what actor string to
+/// grant — for a token's owning account, that's usually `user:<user_id>`,
+/// not the token's display name.
+async fn whoami(Extension(claims): Extension<VerifiedClaims>) -> Json<WhoAmIResponse> {
+    let bypasses_policy_checks = claims.scopes.contains(&PolicyAction::ManageAuth);
+    Json(WhoAmIResponse {
+        actor: claims.actor,
+        org_id: claims.org_id,
+        repository_id: claims.repository_id,
+        token_id: claims.token_id,
+        scopes: claims.scopes,
+        bypasses_policy_checks,
+    })
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct RegistryProtocol {
     pub version: String,
     pub resources: Vec<String>,
@@ -998,6 +1164,7 @@ impl Default for RegistryProtocol {
                 "proposals",
                 "merge-intents",
                 "environments",
+                "environment-variables",
                 "policies",
                 "vector-indexes",
                 "vector-search",
@@ -1069,7 +1236,116 @@ pub struct RegistrySyncBundle {
     pub operations: Vec<Operation>,
     #[serde(default)]
     pub git_migration_records: Vec<GitMigrationRecord>,
+    #[serde(default)]
+    pub environment_variables: Vec<EnvironmentVariable>,
+    #[serde(default)]
+    pub environment_variable_versions: Vec<EnvironmentVariableVersion>,
+    #[serde(default)]
+    pub environments: Vec<Environment>,
     pub blobs: Vec<RegistryBlobRecord>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct EnvironmentVariableView {
+    pub variable: EnvironmentVariable,
+    #[serde(default)]
+    pub current_version: Option<EnvironmentVariableVersionView>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct EnvironmentVariableVersionView {
+    pub id: EnvironmentVariableVersionId,
+    pub variable_id: EnvironmentVariableId,
+    pub key: String,
+    pub sensitivity: VariableSensitivity,
+    pub value_kind: VariableValueKind,
+    pub storage_mode: VariableSecretStorageMode,
+    #[serde(default)]
+    pub masked_value: Option<String>,
+    #[serde(default)]
+    pub plaintext_value: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<ContentHash>,
+    #[serde(default)]
+    pub encryption_key_id: Option<String>,
+    #[serde(default)]
+    pub wrapped_data_key: Option<String>,
+    #[serde(default)]
+    pub nonce: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub value_digest: Option<String>,
+    pub created_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct ListEnvironmentVariablesResponse {
+    pub variables: Vec<EnvironmentVariableView>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct UpsertEnvironmentVariableRequest {
+    pub key: String,
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default)]
+    pub scope: Option<VariableScope>,
+    #[serde(default)]
+    pub value_kind: Option<VariableValueKind>,
+    #[serde(default)]
+    pub availability: Vec<VariableAvailability>,
+    #[serde(default)]
+    pub sensitivity: Option<VariableSensitivity>,
+    #[serde(default)]
+    pub storage_mode: Option<VariableSecretStorageMode>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub reference: Option<VariableReference>,
+    #[serde(default)]
+    pub actor: Option<Actor>,
+    #[serde(default)]
+    pub stage: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct UpsertEnvironmentVariableResponse {
+    pub variable: EnvironmentVariableView,
+    #[serde(default)]
+    pub change: Option<EnvironmentVariableChange>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct InjectEnvironmentVariablesRequest {
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default)]
+    pub service_id: Option<String>,
+    #[serde(default)]
+    pub availability: Option<VariableAvailability>,
+    pub actor: Actor,
+    #[serde(default)]
+    pub deploy_intent_id: Option<DeployIntentId>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct InjectedEnvironmentVariable {
+    pub key: String,
+    pub value: String,
+    pub variable_id: EnvironmentVariableId,
+    pub version_id: EnvironmentVariableVersionId,
+    pub sensitivity: VariableSensitivity,
+    pub availability: Vec<VariableAvailability>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct InjectEnvironmentVariablesResponse {
+    pub variables: Vec<InjectedEnvironmentVariable>,
+    #[serde(default)]
+    pub redaction_tokens: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
@@ -1463,6 +1739,10 @@ pub struct InMemoryRegistry {
     merge_intents: BTreeMap<MergeIntentId, MergeIntent>,
     release_gates: BTreeMap<ReleaseGateId, ReleaseGate>,
     environments: BTreeMap<EnvironmentId, Environment>,
+    environment_variables: BTreeMap<EnvironmentVariableId, EnvironmentVariable>,
+    environment_variable_versions:
+        BTreeMap<EnvironmentVariableVersionId, EnvironmentVariableVersion>,
+    environment_variable_changes: BTreeMap<String, EnvironmentVariableChange>,
     integrations: BTreeMap<String, IntegrationActor>,
     policies: BTreeMap<PolicyId, VisibilityPolicy>,
     cedar_policy_documents: BTreeMap<String, StoredCedarPolicyDocument>,
@@ -1476,7 +1756,7 @@ pub struct InMemoryRegistry {
     auth_tokens: BTreeMap<AuthTokenId, AuthToken>,
     proposal_comments: BTreeMap<ReviewCommentId, ProposalComment>,
     proposal_checks: BTreeMap<StatusCheckId, ProposalStatusCheck>,
-    deploy_configs: BTreeMap<RepositoryId, RepositoryDeployConfig>,
+    deploy_configs: BTreeMap<(RepositoryId, String), RepositoryDeployConfig>,
     webhook_endpoints: BTreeMap<WebhookEndpointId, WebhookEndpoint>,
     webhook_events: BTreeMap<WebhookEventId, WebhookEvent>,
     sync_sessions: BTreeMap<SyncSessionId, SyncSession>,
@@ -1510,6 +1790,12 @@ pub struct PersistedRegistry {
     pub merge_intents: Vec<MergeIntent>,
     pub release_gates: Vec<ReleaseGate>,
     pub environments: Vec<Environment>,
+    #[serde(default)]
+    pub environment_variables: Vec<EnvironmentVariable>,
+    #[serde(default)]
+    pub environment_variable_versions: Vec<EnvironmentVariableVersion>,
+    #[serde(default)]
+    pub environment_variable_changes: Vec<EnvironmentVariableChange>,
     pub integrations: Vec<IntegrationActor>,
     pub policies: Vec<VisibilityPolicy>,
     #[serde(default)]
@@ -1578,8 +1864,57 @@ impl InMemoryRegistry {
         }
         let persisted = PersistedRegistry::from(self.clone());
         let content = serde_json::to_string_pretty(&persisted).map_err(std::io::Error::other)?;
-        fs::write(path, format!("{content}\n"))
+        atomic_write_file(path, format!("{content}\n").as_bytes())
     }
+}
+
+/// Load a file-backed registry snapshot.
+///
+/// Missing files bootstrap an empty registry. Corrupt or unreadable files fail
+/// closed so the process cannot silently start with an empty writable index.
+fn load_registry_from_persistence(path: Option<&PathBuf>) -> Result<InMemoryRegistry, String> {
+    let Some(path) = path else {
+        return Ok(InMemoryRegistry::default());
+    };
+    match InMemoryRegistry::load_from_path(path) {
+        Ok(registry) => Ok(registry),
+        Err(error) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %error,
+                "failed to load registry persistence; refusing empty boot"
+            );
+            Err(format!(
+                "failed to load registry persistence at {}: {error}",
+                path.display()
+            ))
+        }
+    }
+}
+
+fn atomic_write_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp_path = path.with_file_name(format!(
+        ".nebula-registry-tmp-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("registry.json"),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+    {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temp_path, path)?;
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 impl From<PersistedRegistry> for InMemoryRegistry {
@@ -1688,6 +2023,21 @@ impl From<PersistedRegistry> for InMemoryRegistry {
                 .into_iter()
                 .map(|environment| (environment.id.clone(), environment))
                 .collect(),
+            environment_variables: value
+                .environment_variables
+                .into_iter()
+                .map(|variable| (variable.id.clone(), variable))
+                .collect(),
+            environment_variable_versions: value
+                .environment_variable_versions
+                .into_iter()
+                .map(|version| (version.id.clone(), version))
+                .collect(),
+            environment_variable_changes: value
+                .environment_variable_changes
+                .into_iter()
+                .map(|change| (change.id.clone(), change))
+                .collect(),
             integrations: value
                 .integrations
                 .into_iter()
@@ -1741,7 +2091,12 @@ impl From<PersistedRegistry> for InMemoryRegistry {
             deploy_configs: value
                 .deploy_configs
                 .into_iter()
-                .map(|config| (config.repository_id.clone(), config))
+                .map(|config| {
+                    (
+                        (config.repository_id.clone(), config.service_id.clone()),
+                        config,
+                    )
+                })
                 .collect(),
             auth_tokens: value
                 .auth_tokens
@@ -1821,6 +2176,15 @@ impl From<InMemoryRegistry> for PersistedRegistry {
             merge_intents: value.merge_intents.into_values().collect(),
             release_gates: value.release_gates.into_values().collect(),
             environments: value.environments.into_values().collect(),
+            environment_variables: value.environment_variables.into_values().collect(),
+            environment_variable_versions: value
+                .environment_variable_versions
+                .into_values()
+                .collect(),
+            environment_variable_changes: value
+                .environment_variable_changes
+                .into_values()
+                .collect(),
             integrations: value.integrations.into_values().collect(),
             policies: value.policies.into_values().collect(),
             cedar_policy_documents: value.cedar_policy_documents.into_values().collect(),
@@ -1864,7 +2228,7 @@ fn apply_bootstrap_auth_tokens(
             id: token_id.clone(),
             repository_id: None,
             org_id: None,
-            actor: Actor::Integration("horizon".to_string()),
+            actor: Actor::Integration(token.name.clone()),
             kind: AuthTokenKind::Integration,
             name: token.name.clone(),
             token_hash: ContentHash::sha256(raw_token.as_bytes()).digest,
@@ -1895,6 +2259,7 @@ struct AppState {
     telemetry_event_file: Option<PathBuf>,
     telemetry_webhook_url: Option<String>,
     telemetry_webhook_secret: Option<String>,
+    secret_encryption_key: Option<String>,
     http_client: reqwest::Client,
 }
 
@@ -1969,15 +2334,15 @@ fn emit_telemetry_event(state: AppState, event: NebulaTelemetryEvent) {
         return;
     }
     tokio::spawn(async move {
-        if let Some(path) = &state.telemetry_event_file {
-            if let Err(error) = append_telemetry_event(path, &event).await {
-                tracing::warn!(%error, event_id = %event.event_id, "failed to append telemetry event");
-            }
+        if let Some(path) = &state.telemetry_event_file
+            && let Err(error) = append_telemetry_event(path, &event).await
+        {
+            tracing::warn!(%error, event_id = %event.event_id, "failed to append telemetry event");
         }
-        if let Some(url) = &state.telemetry_webhook_url {
-            if let Err(error) = post_telemetry_event(&state, url, &event).await {
-                tracing::warn!(%error, event_id = %event.event_id, "failed to post telemetry event");
-            }
+        if let Some(url) = &state.telemetry_webhook_url
+            && let Err(error) = post_telemetry_event(&state, url, &event).await
+        {
+            tracing::warn!(%error, event_id = %event.event_id, "failed to post telemetry event");
         }
     });
 }
@@ -2121,6 +2486,7 @@ async fn schema() -> Json<Value> {
     insert_schema!("DeployReleaseGateEvidence", DeployReleaseGateEvidence);
     insert_schema!("AstracollabDeployHandoff", AstracollabDeployHandoff);
     insert_schema!("DeploymentGrant", DeploymentGrant);
+    insert_schema!("WhoAmIResponse", WhoAmIResponse);
     insert_schema!("RepositoryDeployConfig", RepositoryDeployConfig);
     insert_schema!(
         "SetRepositoryDeployConfigRequest",
@@ -2199,6 +2565,183 @@ impl AuthTokenAuthority {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ListGalaxiesQuery {
+    #[serde(default)]
+    org_id: Option<String>,
+}
+
+async fn list_galaxies(
+    State(state): State<AppState>,
+    claims: Option<Extension<VerifiedClaims>>,
+    Query(params): Query<ListGalaxiesQuery>,
+) -> Result<Json<Vec<RepositoryRecord>>, ApiError> {
+    let (actor, bypasses_policy_checks) = claims
+        .map(|Extension(claims)| {
+            let bypass = claims.scopes.contains(&PolicyAction::ManageAuth);
+            (claims.actor, bypass)
+        })
+        .unwrap_or((Actor::Public, false));
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+    let policies = registry.policies.values().cloned().collect::<Vec<_>>();
+    let mut accessible = Vec::new();
+    for repo in registry.repositories.values() {
+        if let Some(org_id) = &params.org_id
+            && repo.org_id.as_deref() != Some(org_id.as_str())
+        {
+            continue;
+        }
+        // Mirrors the auth middleware's ManageAuth bypass (lib.rs auth_middleware):
+        // an admin identity shouldn't need an explicit per-repo policy grant just
+        // to see a galaxy in the list that `GET /v1/galaxies/{id}` already lets
+        // them read directly.
+        let authorized = bypasses_policy_checks || {
+            let cedar_documents = registry
+                .cedar_policy_documents
+                .values()
+                .filter(|document| document.enabled && document.repository_id == repo.id)
+                .map(|document| nebula_policy::CedarPolicyDocument {
+                    id: document.id.clone(),
+                    repository_id: document.repository_id.clone(),
+                    text: document.text.clone(),
+                    version: document.version,
+                    enabled: document.enabled,
+                })
+                .collect::<Vec<_>>();
+            let authorizer =
+                CedarNebulaAuthorizer::with_cedar_documents(policies.clone(), cedar_documents);
+            authorizer
+                .authorize(AuthorizationRequest {
+                    actor: actor.clone(),
+                    token_id: None,
+                    action: PolicyAction::ReadBlob,
+                    repository_id: repo.id.clone(),
+                    resource_kind: "Repository".to_string(),
+                    resource_id: format!("/v1/galaxies/{}", repo.id),
+                    path: None,
+                    environment: None,
+                })
+                .is_ok()
+        };
+        if authorized {
+            accessible.push(repo.clone());
+        }
+    }
+    Ok(Json(accessible))
+}
+
+/// Name of the `Actor::Integration` used by the astracollab dashboard's
+/// server-side Nebula Registry client (bootstrap token configured via
+/// `NEBULA_REGISTRY_ASTRACOLLAB_SERVICE_TOKEN`). Every galaxy is granted a
+/// least-privilege policy trusting this actor for content sync (blob/tree
+/// read+write) at creation time, since astracollab is itself the hosting
+/// platform for the galaxy — see `default_astracollab_service_policy`.
+const ASTRACOLLAB_SERVICE_ACTOR_NAME: &str = "astracollab-dashboard";
+const HORIZON_INTEGRATION_ACTOR_NAME: &str = "horizon";
+
+fn default_astracollab_service_policy(repository_id: &RepositoryId) -> VisibilityPolicy {
+    VisibilityPolicy {
+        id: PolicyId::generated(),
+        repository_id: repository_id.clone(),
+        name: "astracollab-dashboard-content-sync".to_string(),
+        priority: 0,
+        rules: vec![PolicyRule {
+            actor: Actor::Integration(ASTRACOLLAB_SERVICE_ACTOR_NAME.to_string()),
+            token_id: None,
+            environment_id: None,
+            environment_kind: None,
+            path_glob: None,
+            key_glob: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            actions: vec![PolicyAction::ReadBlob, PolicyAction::WriteChangeSet],
+            decision: PolicyDecision::Allow,
+            reason: Some(
+                "astracollab-dashboard service token: content sync for hosted galaxy".to_string(),
+            ),
+        }],
+    }
+}
+
+/// Every galaxy created with an `org_id` automatically trusts a JWT-
+/// authenticated `Actor::Team(org_id)` for baseline content sync. This is
+/// what lets an external identity provider embedding Nebula (e.g. a SaaS
+/// product minting its own per-org JWTs via JWKS, verified through
+/// `AuthMode::Jwks`) allow members of that org to read/write their own
+/// galaxy without any further registry-side policy configuration — there is
+/// no policy-management API, so this default is the only way such a token
+/// is ever authorized. Scoped to the galaxy's own `org_id` at creation time,
+/// so a token minted for one org can never be replayed against another
+/// org's galaxy (a different galaxy's policy set never contains this org's
+/// `Actor::Team` rule).
+fn default_org_actor_policy(repository_id: &RepositoryId, org_id: &str) -> VisibilityPolicy {
+    VisibilityPolicy {
+        id: PolicyId::generated(),
+        repository_id: repository_id.clone(),
+        name: "org-actor-content-sync".to_string(),
+        priority: 0,
+        rules: vec![PolicyRule {
+            actor: Actor::Team(org_id.to_string()),
+            token_id: None,
+            environment_id: None,
+            environment_kind: None,
+            path_glob: None,
+            key_glob: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            actions: vec![
+                PolicyAction::ReadBlob,
+                PolicyAction::WriteChangeSet,
+                PolicyAction::MergeChangeSet,
+            ],
+            decision: PolicyDecision::Allow,
+            reason: Some(
+                "org-scoped JWT actor: content sync for this org's own galaxy".to_string(),
+            ),
+        }],
+    }
+}
+
+fn default_horizon_integration_policy(repository_id: &RepositoryId) -> VisibilityPolicy {
+    VisibilityPolicy {
+        id: PolicyId::generated(),
+        repository_id: repository_id.clone(),
+        name: "horizon-integration-deploy".to_string(),
+        priority: 0,
+        rules: vec![PolicyRule {
+            actor: Actor::Integration(HORIZON_INTEGRATION_ACTOR_NAME.to_string()),
+            token_id: None,
+            environment_id: None,
+            environment_kind: None,
+            path_glob: None,
+            key_glob: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            actions: vec![
+                PolicyAction::ReadBuildSource,
+                PolicyAction::CreateProjection,
+                PolicyAction::Deploy,
+                PolicyAction::InjectVariable,
+                PolicyAction::ManageDeployConfig,
+            ],
+            decision: PolicyDecision::Allow,
+            reason: Some(
+                "Horizon platform integration: deploy services and inject environment variables"
+                    .to_string(),
+            ),
+        }],
+    }
+}
+
 async fn create_repository(
     State(state): State<AppState>,
     Json(request): Json<CreateRepositoryRequest>,
@@ -2211,6 +2754,12 @@ async fn create_repository(
         name: request.name,
         org_id: request.org_id,
     };
+    let service_policy = default_astracollab_service_policy(&repo.id);
+    let horizon_policy = default_horizon_integration_policy(&repo.id);
+    let org_policy = repo
+        .org_id
+        .as_deref()
+        .map(|org_id| default_org_actor_policy(&repo.id, org_id));
     if let Some(store) = &state.durable_store {
         let value = serde_json::to_value(&repo)
             .map_err(|error| ApiError::internal(format!("failed to encode repository: {error}")))?;
@@ -2218,13 +2767,49 @@ async fn create_repository(
             .put_repository_record(&repo.id, value)
             .await
             .map_err(storage_api_error)?;
+        durable_put_resource(
+            &state,
+            Some(&repo.id),
+            "policy",
+            service_policy.id.as_str(),
+            &service_policy,
+        )
+        .await?;
+        durable_put_resource(
+            &state,
+            Some(&repo.id),
+            "policy",
+            horizon_policy.id.as_str(),
+            &horizon_policy,
+        )
+        .await?;
+        if let Some(org_policy) = &org_policy {
+            durable_put_resource(
+                &state,
+                Some(&repo.id),
+                "policy",
+                org_policy.id.as_str(),
+                org_policy,
+            )
+            .await?;
+        }
     }
-    state
-        .registry
-        .write()
-        .map_err(|_| ApiError::internal("registry lock poisoned"))?
-        .repositories
-        .insert(repo.id.clone(), repo.clone());
+    {
+        let mut registry = state
+            .registry
+            .write()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        registry.repositories.insert(repo.id.clone(), repo.clone());
+        registry
+            .policies
+            .insert(service_policy.id.clone(), service_policy);
+        registry
+            .policies
+            .insert(horizon_policy.id.clone(), horizon_policy);
+        if let Some(org_policy) = org_policy {
+            registry.policies.insert(org_policy.id.clone(), org_policy);
+        }
+    }
     persist_state(&state).await?;
     Ok(Json(repo))
 }
@@ -2301,12 +2886,17 @@ async fn put_blob(
         &blob,
     )
     .await?;
+    let cached_bytes = if state.blob_store.is_some() {
+        Vec::new()
+    } else {
+        bytes
+    };
     state
         .registry
         .write()
         .map_err(|_| ApiError::internal("registry lock poisoned"))?
         .blobs
-        .insert(blob.hash.clone(), (blob.clone(), bytes));
+        .insert(blob.hash.clone(), (blob.clone(), cached_bytes));
     persist_state(&state).await?;
     Ok(Json(BlobPutResponse { blob }))
 }
@@ -2598,6 +3188,7 @@ async fn put_ref(
         );
     }
     persist_state(&state).await?;
+    schedule_auto_deploys_for_ref(state.clone(), repository_id, reference.clone());
     Ok(Json(reference))
 }
 
@@ -2759,6 +3350,57 @@ async fn get_proposal(
     )
 }
 
+async fn list_policies(
+    State(state): State<AppState>,
+    Path(repository_id): Path<String>,
+) -> Result<Json<Vec<VisibilityPolicy>>, ApiError> {
+    let repository_id = RepositoryId::new(repository_id);
+    ensure_repo(&state, &repository_id)?;
+    let mut policies = {
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        registry
+            .policies
+            .values()
+            .filter(|policy| policy.repository_id == repository_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    policies.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    Ok(Json(policies))
+}
+
+async fn delete_policy(
+    State(state): State<AppState>,
+    Path((repository_id, policy_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let repository_id = RepositoryId::new(repository_id);
+    ensure_repo(&state, &repository_id)?;
+    let policy_id = PolicyId::new(policy_id);
+    let removed = {
+        let mut registry = state
+            .registry
+            .write()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        match registry.policies.get(&policy_id) {
+            Some(policy) if policy.repository_id == repository_id => {
+                registry.policies.remove(&policy_id);
+                true
+            }
+            Some(_) => return Err(ApiError::bad_request("policy repository mismatch")),
+            None => false,
+        }
+    };
+    if !removed {
+        return Err(ApiError::not_found("policy not found"));
+    }
+    durable_delete_resource(&state, Some(&repository_id), "policy", policy_id.as_str()).await?;
+    persist_state(&state).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn put_policy(
     State(state): State<AppState>,
     Path(repository_id): Path<String>,
@@ -2839,6 +3481,25 @@ async fn put_cedar_policy_document(
     Ok(Json(document))
 }
 
+async fn list_environments(
+    State(state): State<AppState>,
+    Path(repository_id): Path<String>,
+) -> Result<Json<Vec<Environment>>, ApiError> {
+    let repository_id = RepositoryId::new(repository_id);
+    ensure_repo(&state, &repository_id)?;
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+    let environments = registry
+        .environments
+        .values()
+        .filter(|environment| environment.repository_id == repository_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(Json(environments))
+}
+
 async fn put_environment(
     State(state): State<AppState>,
     Path(repository_id): Path<String>,
@@ -2865,6 +3526,340 @@ async fn put_environment(
         .insert(environment.id.clone(), environment.clone());
     persist_state(&state).await?;
     Ok(Json(environment))
+}
+
+async fn list_environment_variables(
+    State(state): State<AppState>,
+    Path((repository_id, environment_id)): Path<(String, String)>,
+) -> Result<Json<ListEnvironmentVariablesResponse>, ApiError> {
+    let repository_id = RepositoryId::new(repository_id);
+    let environment_id = EnvironmentId::new(environment_id);
+    ensure_repo(&state, &repository_id)?;
+    ensure_environment(&state, &repository_id, &environment_id).await?;
+    let variables = {
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        registry
+            .environment_variables
+            .values()
+            .filter(|variable| {
+                variable.repository_id == repository_id && variable.environment_id == environment_id
+            })
+            .map(|variable| {
+                let current_version = variable
+                    .current_version_id
+                    .as_ref()
+                    .and_then(|id| registry.environment_variable_versions.get(id))
+                    .map(|version| variable_version_view(version, false));
+                EnvironmentVariableView {
+                    variable: variable.clone(),
+                    current_version,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(Json(ListEnvironmentVariablesResponse { variables }))
+}
+
+async fn upsert_environment_variable(
+    State(state): State<AppState>,
+    claims: Option<Extension<VerifiedClaims>>,
+    Path((repository_id, environment_id)): Path<(String, String)>,
+    Json(request): Json<UpsertEnvironmentVariableRequest>,
+) -> Result<Json<UpsertEnvironmentVariableResponse>, ApiError> {
+    let repository_id = RepositoryId::new(repository_id);
+    let environment_id = EnvironmentId::new(environment_id);
+    ensure_repo(&state, &repository_id)?;
+    let environment = ensure_environment(&state, &repository_id, &environment_id).await?;
+    let key = normalize_variable_key(&request.key)?;
+    let actor = request
+        .actor
+        .clone()
+        .or_else(|| claims.map(|Extension(claims)| claims.actor))
+        .unwrap_or(Actor::Public);
+    let scope = request.scope.clone().unwrap_or(VariableScope::Shared);
+    let variable_id = EnvironmentVariable::stable_id(&repository_id, &environment_id, &scope, &key);
+    let now = now_unix_ms();
+    let existing = {
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        registry.environment_variables.get(&variable_id).cloned()
+    };
+    let sensitivity = request
+        .sensitivity
+        .clone()
+        .unwrap_or_else(|| default_variable_sensitivity(&key, &environment.kind));
+    let value_kind = request
+        .value_kind
+        .clone()
+        .unwrap_or_else(|| default_variable_value_kind(&sensitivity, request.reference.as_ref()));
+    let storage_mode = request
+        .storage_mode
+        .clone()
+        .unwrap_or_else(|| default_secret_storage_mode(&sensitivity, &value_kind));
+    let availability = if request.availability.is_empty() {
+        vec![VariableAvailability::Build, VariableAvailability::Runtime]
+    } else {
+        request.availability.clone()
+    };
+    let mut variable = existing.clone().unwrap_or(EnvironmentVariable {
+        id: variable_id.clone(),
+        repository_id: repository_id.clone(),
+        workspace_id: request.workspace_id.clone(),
+        environment_id: environment_id.clone(),
+        scope: scope.clone(),
+        key: key.clone(),
+        value_kind: value_kind.clone(),
+        availability: availability.clone(),
+        sensitivity: sensitivity.clone(),
+        storage_mode: storage_mode.clone(),
+        current_version_id: None,
+        reference: request.reference.clone(),
+        created_by: Some(actor.clone()),
+        updated_by: Some(actor.clone()),
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+    });
+    variable.workspace_id = request.workspace_id.clone().or(variable.workspace_id);
+    variable.scope = scope;
+    variable.key = key.clone();
+    variable.value_kind = value_kind.clone();
+    variable.availability = availability;
+    variable.sensitivity = sensitivity.clone();
+    variable.storage_mode = storage_mode.clone();
+    variable.reference = request.reference.clone();
+    variable.updated_by = Some(actor.clone());
+    variable.updated_at_unix_ms = now;
+
+    let mut version = None;
+    if let Some(value) = request.value.as_ref() {
+        let created = create_environment_variable_version(
+            &state,
+            &repository_id,
+            &variable_id,
+            &key,
+            &value_kind,
+            &sensitivity,
+            &storage_mode,
+            value,
+            actor.clone(),
+        )
+        .await?;
+        if !request.stage {
+            variable.current_version_id = Some(created.id.clone());
+        }
+        version = Some(created);
+    }
+
+    let change = EnvironmentVariableChange {
+        id: format!("envchg_{}_{}", variable.id.as_str(), now),
+        repository_id: repository_id.clone(),
+        variable_id: variable.id.clone(),
+        actor,
+        action: if existing.is_some() {
+            "update".to_string()
+        } else {
+            "create".to_string()
+        },
+        state: if request.stage {
+            VariableChangeState::Staged
+        } else {
+            VariableChangeState::Applied
+        },
+        before_version_id: existing.and_then(|variable| variable.current_version_id),
+        after_version_id: version.as_ref().map(|version| version.id.clone()),
+        reason: request.reason.clone(),
+        created_at_unix_ms: now,
+    };
+
+    durable_put_resource(
+        &state,
+        Some(&repository_id),
+        "environment_variable",
+        variable.id.as_str(),
+        &variable,
+    )
+    .await?;
+    if let Some(version) = &version {
+        durable_put_resource(
+            &state,
+            Some(&repository_id),
+            "environment_variable_version",
+            version.id.as_str(),
+            version,
+        )
+        .await?;
+    }
+    durable_put_resource(
+        &state,
+        Some(&repository_id),
+        "environment_variable_change",
+        &change.id,
+        &change,
+    )
+    .await?;
+    {
+        let mut registry = state
+            .registry
+            .write()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        if let Some(version) = version.clone() {
+            registry
+                .environment_variable_versions
+                .insert(version.id.clone(), version);
+        }
+        registry
+            .environment_variable_changes
+            .insert(change.id.clone(), change.clone());
+        registry
+            .environment_variables
+            .insert(variable.id.clone(), variable.clone());
+    }
+    persist_state(&state).await?;
+    let current_version = if let Some(version_id) = variable.current_version_id.as_ref() {
+        let current =
+            if let Some(version) = version.as_ref().filter(|version| &version.id == version_id) {
+                Some(version.clone())
+            } else {
+                state
+                    .registry
+                    .read()
+                    .map_err(|_| ApiError::internal("registry lock poisoned"))?
+                    .environment_variable_versions
+                    .get(version_id)
+                    .cloned()
+            };
+        current.map(|version| variable_version_view(&version, false))
+    } else {
+        None
+    };
+    Ok(Json(UpsertEnvironmentVariableResponse {
+        variable: EnvironmentVariableView {
+            current_version,
+            variable,
+        },
+        change: Some(change),
+    }))
+}
+
+async fn inject_environment_variables(
+    State(state): State<AppState>,
+    Path((repository_id, environment_id)): Path<(String, String)>,
+    Json(request): Json<InjectEnvironmentVariablesRequest>,
+) -> Result<Json<InjectEnvironmentVariablesResponse>, ApiError> {
+    let repository_id = RepositoryId::new(repository_id);
+    let environment_id = EnvironmentId::new(environment_id);
+    ensure_repo(&state, &repository_id)?;
+    ensure_environment(&state, &repository_id, &environment_id).await?;
+    let variables = {
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        registry
+            .environment_variables
+            .values()
+            .filter(|variable| variable.repository_id == repository_id)
+            .filter(|variable| variable.environment_id == environment_id)
+            .filter(|variable| {
+                request.service_id.as_ref().is_none_or(|service_id| {
+                    matches!(&variable.scope, VariableScope::Shared)
+                        || matches!(&variable.scope, VariableScope::Service { service_id: id } if id == service_id)
+                })
+            })
+            .filter(|variable| {
+                request
+                    .availability
+                    .as_ref()
+                    .is_none_or(|availability| variable.availability.contains(availability))
+            })
+            .filter_map(|variable| {
+                let version_id = variable.current_version_id.as_ref()?;
+                let version = registry.environment_variable_versions.get(version_id)?;
+                Some((variable.clone(), version.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut injected = Vec::new();
+    let mut redaction_tokens = BTreeMap::new();
+    for (variable, mut version) in variables {
+        let value = decrypt_environment_variable_value(&state, &version)?;
+        if variable.sensitivity.is_write_only() {
+            redaction_tokens.insert(variable.key.clone(), redaction_values(&value));
+        }
+        version.last_injected_at_unix_ms = Some(now_unix_ms());
+        version.last_used_by_deploy_id = request.deploy_intent_id.clone();
+        durable_put_resource(
+            &state,
+            Some(&repository_id),
+            "environment_variable_version",
+            version.id.as_str(),
+            &version,
+        )
+        .await?;
+        injected.push(InjectedEnvironmentVariable {
+            key: variable.key.clone(),
+            value,
+            variable_id: variable.id,
+            version_id: version.id.clone(),
+            sensitivity: variable.sensitivity,
+            availability: variable.availability,
+        });
+        state
+            .registry
+            .write()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?
+            .environment_variable_versions
+            .insert(version.id.clone(), version);
+    }
+    Ok(Json(InjectEnvironmentVariablesResponse {
+        variables: injected,
+        redaction_tokens,
+    }))
+}
+
+async fn export_environment_variable(
+    State(state): State<AppState>,
+    Path((repository_id, _environment_id, variable_id)): Path<(String, String, String)>,
+) -> Result<Json<InjectedEnvironmentVariable>, ApiError> {
+    let repository_id = RepositoryId::new(repository_id);
+    let variable_id = EnvironmentVariableId::new(variable_id);
+    ensure_repo(&state, &repository_id)?;
+    let (variable, version) = {
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        let variable = registry
+            .environment_variables
+            .get(&variable_id)
+            .filter(|variable| variable.repository_id == repository_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("environment variable not found"))?;
+        let version_id = variable
+            .current_version_id
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("environment variable has no value"))?;
+        let version = registry
+            .environment_variable_versions
+            .get(version_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("environment variable value not found"))?;
+        (variable, version)
+    };
+    let value = decrypt_environment_variable_value(&state, &version)?;
+    Ok(Json(InjectedEnvironmentVariable {
+        key: variable.key,
+        value,
+        variable_id: variable.id,
+        version_id: version.id,
+        sensitivity: variable.sensitivity,
+        availability: variable.availability,
+    }))
 }
 
 async fn put_integration(
@@ -3268,7 +4263,7 @@ async fn put_deployment_grant(
 
 async fn get_deploy_config(
     State(state): State<AppState>,
-    Path(repository_id): Path<String>,
+    Path((repository_id, service_id)): Path<(String, String)>,
 ) -> Result<Json<RepositoryDeployConfigView>, ApiError> {
     let repository_id = RepositoryId::new(repository_id);
     ensure_repo(&state, &repository_id)?;
@@ -3277,21 +4272,27 @@ async fn get_deploy_config(
             .registry
             .read()
             .map_err(|_| ApiError::internal("registry lock poisoned"))?;
-        registry.deploy_configs.get(&repository_id).cloned()
+        registry
+            .deploy_configs
+            .get(&(repository_id, service_id))
+            .cloned()
     };
     let config = config.ok_or_else(|| ApiError::not_found("deploy config not set"))?;
     Ok(Json(RepositoryDeployConfigView {
         provider_key: config.provider_key,
         deploy_url: config.deploy_url,
         service_id: config.service_id,
+        environment_id: config.environment_id,
         environment_name: config.environment_name,
         context_path: config.context_path,
+        env_policy: config.env_policy,
+        auto_deploy: config.auto_deploy,
     }))
 }
 
 async fn put_deploy_config(
     State(state): State<AppState>,
-    Path(repository_id): Path<String>,
+    Path((repository_id, service_id)): Path<(String, String)>,
     Json(request): Json<SetRepositoryDeployConfigRequest>,
 ) -> Result<Json<RepositoryDeployConfigView>, ApiError> {
     let repository_id = RepositoryId::new(repository_id);
@@ -3304,7 +4305,7 @@ async fn put_deploy_config(
             "signing_secret must be at least 16 characters",
         ));
     }
-    if request.service_id.trim().is_empty() {
+    if service_id.trim().is_empty() {
         return Err(ApiError::bad_request("service_id is required"));
     }
     let config = RepositoryDeployConfig {
@@ -3312,15 +4313,18 @@ async fn put_deploy_config(
         provider_key: request.provider_key.clone(),
         deploy_url: request.deploy_url.clone(),
         signing_secret: request.signing_secret,
-        service_id: request.service_id.clone(),
+        service_id: service_id.clone(),
+        environment_id: request.environment_id.clone(),
         environment_name: request.environment_name.clone(),
         context_path: request.context_path.clone(),
+        env_policy: request.env_policy.clone(),
+        auto_deploy: request.auto_deploy,
     };
     durable_put_resource(
         &state,
         Some(&repository_id),
         "deploy_config",
-        repository_id.as_str(),
+        &format!("{repository_id}:{service_id}"),
         &config,
     )
     .await?;
@@ -3329,15 +4333,45 @@ async fn put_deploy_config(
         .write()
         .map_err(|_| ApiError::internal("registry lock poisoned"))?
         .deploy_configs
-        .insert(repository_id, config.clone());
+        .insert((repository_id, service_id), config.clone());
     persist_state(&state).await?;
     Ok(Json(RepositoryDeployConfigView {
         provider_key: config.provider_key,
         deploy_url: config.deploy_url,
         service_id: config.service_id,
+        environment_id: config.environment_id,
         environment_name: config.environment_name,
         context_path: config.context_path,
+        env_policy: config.env_policy,
+        auto_deploy: config.auto_deploy,
     }))
+}
+
+async fn delete_deploy_config(
+    State(state): State<AppState>,
+    Path((repository_id, service_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let repository_id = RepositoryId::new(repository_id);
+    ensure_repo(&state, &repository_id)?;
+    let removed = state
+        .registry
+        .write()
+        .map_err(|_| ApiError::internal("registry lock poisoned"))?
+        .deploy_configs
+        .remove(&(repository_id.clone(), service_id.clone()))
+        .is_some();
+    if !removed {
+        return Err(ApiError::not_found("deploy config not set"));
+    }
+    durable_delete_resource(
+        &state,
+        Some(&repository_id),
+        "deploy_config",
+        &format!("{repository_id}:{service_id}"),
+    )
+    .await?;
+    persist_state(&state).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_deploy_intent(
@@ -3347,6 +4381,15 @@ async fn create_deploy_intent(
 ) -> Result<Json<DeployIntentResponse>, ApiError> {
     let repository_id = RepositoryId::new(repository_id);
     ensure_repo(&state, &repository_id)?;
+    let intent = execute_create_deploy_intent(&state, repository_id, request).await?;
+    Ok(Json(DeployIntentResponse { intent }))
+}
+
+async fn execute_create_deploy_intent(
+    state: &AppState,
+    repository_id: RepositoryId,
+    request: CreateDeployIntentRequest,
+) -> Result<DeployIntent, ApiError> {
     let projection = {
         let registry = state
             .registry
@@ -3366,7 +4409,25 @@ async fn create_deploy_intent(
             .registry
             .read()
             .map_err(|_| ApiError::internal("registry lock poisoned"))?;
-        registry.deploy_configs.get(&repository_id).cloned()
+        if let Some(service_id) = request.target.as_ref().map(|target| &target.service_id) {
+            registry
+                .deploy_configs
+                .get(&(repository_id.clone(), service_id.clone()))
+                .cloned()
+        } else {
+            let mut configs = registry
+                .deploy_configs
+                .iter()
+                .filter(|((id, _), _)| *id == repository_id)
+                .map(|(_, config)| config);
+            let first = configs.next().cloned();
+            if first.is_some() && configs.next().is_some() {
+                return Err(ApiError::bad_request(
+                    "this galaxy has deploy configs for multiple services; specify target.service_id",
+                ));
+            }
+            first
+        }
     };
 
     let target = if let Some(ref config) = deploy_config {
@@ -3380,9 +4441,21 @@ async fn create_deploy_intent(
         request.target
     };
 
-    let policy_evidence = deploy_policy_evidence(&projection)?;
+    let env_policy = deploy_config
+        .as_ref()
+        .and_then(|config| config.env_policy.clone())
+        .or_else(|| {
+            target.as_ref().map(|target| DeploymentEnvironmentPolicy {
+                environment_name: target.environment_name.clone(),
+                service_ids: vec![target.service_id.clone()],
+                allow_build_variables: false,
+                allow_runtime_variables: false,
+                ..Default::default()
+            })
+        });
+    let policy_evidence = deploy_policy_evidence(&projection, env_policy.clone())?;
     let release_gate_evidence = deploy_release_gate_evidence(
-        &state,
+        state,
         &repository_id,
         request.release_gate_id.as_ref(),
         &request.environment_id,
@@ -3399,6 +4472,7 @@ async fn create_deploy_intent(
         requested_provider_key: request.requested_provider_key,
         requested_by: request.requested_by,
         target,
+        env_policy,
         policy_evidence: Some(policy_evidence),
         release_gate_evidence: Some(release_gate_evidence),
         trigger_source: request.trigger_source,
@@ -3414,13 +4488,13 @@ async fn create_deploy_intent(
         completed_at_unix_ms: None,
     };
     let (archive_uri, archive_digest) =
-        deploy_archive_artifact(&state, &repository_id, &intent).await?;
+        deploy_archive_artifact(state, &repository_id, &intent).await?;
     intent.artifacts.push(DeployArtifactRef {
         kind: "source_archive".to_string(),
         uri: archive_uri,
         digest: Some(format!("sha256:{archive_digest}")),
     });
-    let handoff = sign_deploy_handoff(&state, &intent)?;
+    let handoff = sign_deploy_handoff(state, &intent)?;
     intent.astracollab_request_id = Some(handoff.request_id.clone());
     intent.handoff = Some(handoff.clone());
     intent.attempts = 1;
@@ -3453,11 +4527,14 @@ async fn create_deploy_intent(
             });
         }
     }
-    persist_deploy_intent(&state, &intent).await?;
-    Ok(Json(DeployIntentResponse { intent }))
+    persist_deploy_intent(state, &intent).await?;
+    Ok(intent)
 }
 
-fn deploy_policy_evidence(projection: &Projection) -> Result<DeployPolicyEvidence, ApiError> {
+fn deploy_policy_evidence(
+    projection: &Projection,
+    env_policy: Option<DeploymentEnvironmentPolicy>,
+) -> Result<DeployPolicyEvidence, ApiError> {
     let mut blocked_count = 0_u32;
     let mut embargo_count = 0_u32;
     let mut allowed_actions = Vec::new();
@@ -3506,6 +4583,7 @@ fn deploy_policy_evidence(projection: &Projection) -> Result<DeployPolicyEvidenc
         blocked_count,
         embargo_count,
         manifest_digest: projection_policy_digest(projection)?,
+        env_policy,
     })
 }
 
@@ -3561,15 +4639,15 @@ fn deploy_release_gate_evidence(
     if &gate.repository_id != repository_id {
         return Err(ApiError::bad_request("release gate repository mismatch"));
     }
-    if let Some(gate_environment_id) = &gate.environment_id {
-        if gate_environment_id != environment_id {
-            return Err(ApiError::bad_request("release gate environment mismatch"));
-        }
+    if let Some(gate_environment_id) = &gate.environment_id
+        && gate_environment_id != environment_id
+    {
+        return Err(ApiError::bad_request("release gate environment mismatch"));
     }
-    if let Some(required_actor) = &gate.required_actor {
-        if required_actor != requested_by {
-            return Err(ApiError::bad_request("release gate actor mismatch"));
-        }
+    if let Some(required_actor) = &gate.required_actor
+        && required_actor != requested_by
+    {
+        return Err(ApiError::bad_request("release gate actor mismatch"));
     }
 
     let now = now_unix_ms();
@@ -3681,13 +4759,15 @@ async fn update_deploy_intent_status(
 
 fn valid_deploy_status_transition(current: &DeployIntentState, next: &DeployIntentState) -> bool {
     use DeployIntentState::*;
-    match (current, next) {
-        (Queued, SentToAstracollab | Running | Failed | Cancelled) => true,
-        (SentToAstracollab, Running | Succeeded | Failed | Cancelled) => true,
-        (Running, Running | Succeeded | Failed | Cancelled) => true,
-        (Succeeded, Succeeded) | (Failed, Failed) | (Cancelled, Cancelled) => true,
-        _ => false,
-    }
+    matches!(
+        (current, next),
+        (Queued, SentToAstracollab | Running | Failed | Cancelled)
+            | (SentToAstracollab, Running | Succeeded | Failed | Cancelled)
+            | (Running, Running | Succeeded | Failed | Cancelled)
+            | (Succeeded, Succeeded)
+            | (Failed, Failed)
+            | (Cancelled, Cancelled)
+    )
 }
 
 async fn put_auth_token(
@@ -4516,54 +5596,87 @@ async fn validate_sync_session(
             .ok_or_else(|| ApiError::bad_request("sync session has no chunk manifest"))?
         }
     };
-    let mut missing_chunks = Vec::new();
-    for chunk in &manifest.chunks {
-        let chunk_id = BlobChunkId::from_hash(&chunk.hash);
-        let present_in_memory = state
+    struct PendingChunk {
+        chunk_id: BlobChunkId,
+        chunk_durable_id: String,
+        blob_durable_id: Option<String>,
+        blob_present_in_memory: bool,
+    }
+    let mut pending = Vec::with_capacity(manifest.chunks.len());
+    let mut chunk_durable_ids = Vec::new();
+    let mut blob_durable_ids = Vec::new();
+    {
+        let registry = state
             .registry
             .read()
-            .map_err(|_| ApiError::internal("registry lock poisoned"))?
-            .sync_chunks
-            .contains_key(&(session_id.clone(), chunk_id.clone()));
-        if present_in_memory {
-            continue;
-        }
-        let present_durable_chunk = durable_get_resource::<SyncChunkRecord>(
-            &state,
-            Some(&repository_id),
-            "sync_chunk",
-            &format!("{}_{}", session_id, chunk_id),
-        )
-        .await?
-        .is_some();
-        let present_durable_blob = if let Some(blob_hash) = &chunk.blob_hash {
-            let blob_id = BlobId::from_hash(blob_hash);
-            let present_in_memory = state
-                .registry
-                .read()
-                .map_err(|_| ApiError::internal("registry lock poisoned"))?
-                .staged_blob_uploads
-                .get(&(session_id.clone(), blob_id.clone()))
-                .map(|upload| upload.state == StagedBlobState::Uploaded)
-                .unwrap_or(false);
-            if present_in_memory {
-                true
-            } else {
-                durable_get_resource::<StagedBlobUpload>(
-                    &state,
-                    Some(&repository_id),
-                    "staged_blob_upload",
-                    &format!("{}_{}", session_id, blob_id),
-                )
-                .await?
-                .map(|upload| upload.state == StagedBlobState::Uploaded)
-                .unwrap_or(false)
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        for chunk in &manifest.chunks {
+            let chunk_id = BlobChunkId::from_hash(&chunk.hash);
+            if registry
+                .sync_chunks
+                .contains_key(&(session_id.clone(), chunk_id.clone()))
+            {
+                continue;
             }
-        } else {
-            false
-        };
+            let chunk_durable_id = format!("{}_{}", session_id, chunk_id);
+            let (blob_durable_id, blob_present_in_memory) =
+                if let Some(blob_hash) = &chunk.blob_hash {
+                    let blob_id = BlobId::from_hash(blob_hash);
+                    let present_in_memory = registry
+                        .staged_blob_uploads
+                        .get(&(session_id.clone(), blob_id.clone()))
+                        .map(|upload| upload.state == StagedBlobState::Uploaded)
+                        .unwrap_or(false);
+                    let durable_id = format!("{}_{}", session_id, blob_id);
+                    (Some(durable_id), present_in_memory)
+                } else {
+                    (None, false)
+                };
+            chunk_durable_ids.push(chunk_durable_id.clone());
+            if let Some(durable_id) = &blob_durable_id
+                && !blob_present_in_memory
+            {
+                blob_durable_ids.push(durable_id.clone());
+            }
+            pending.push(PendingChunk {
+                chunk_id,
+                chunk_durable_id,
+                blob_durable_id,
+                blob_present_in_memory,
+            });
+        }
+    }
+    let durable_chunks: BTreeSet<String> = durable_get_resources_batch::<SyncChunkRecord>(
+        &state,
+        Some(&repository_id),
+        "sync_chunk",
+        &chunk_durable_ids,
+    )
+    .await?
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect();
+    let durable_uploaded_blobs: BTreeSet<String> = durable_get_resources_batch::<StagedBlobUpload>(
+        &state,
+        Some(&repository_id),
+        "staged_blob_upload",
+        &blob_durable_ids,
+    )
+    .await?
+    .into_iter()
+    .filter(|(_, upload)| upload.state == StagedBlobState::Uploaded)
+    .map(|(id, _)| id)
+    .collect();
+    let mut missing_chunks = Vec::new();
+    for chunk in pending {
+        let present_durable_chunk = durable_chunks.contains(&chunk.chunk_durable_id);
+        let present_durable_blob = chunk.blob_present_in_memory
+            || chunk
+                .blob_durable_id
+                .as_ref()
+                .is_some_and(|id| durable_uploaded_blobs.contains(id));
         if !present_durable_chunk && !present_durable_blob {
-            missing_chunks.push(chunk_id);
+            missing_chunks.push(chunk.chunk_id);
         }
     }
     let valid = missing_chunks.is_empty();
@@ -4684,30 +5797,62 @@ async fn commit_sync_session(
             .ok_or_else(|| ApiError::bad_request("sync session has no chunk manifest"))?
         };
         let mut chunks_by_hash = memory_chunks_by_hash;
-        for descriptor in &manifest.chunks {
-            if chunks_by_hash.contains_key(&descriptor.hash) {
-                continue;
-            }
-            if descriptor
-                .blob_hash
-                .as_ref()
-                .map(|hash| staged_blob_hashes.contains(hash))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            let chunk_id = BlobChunkId::from_hash(&descriptor.hash);
-            if let Some(record) = durable_get_resource::<SyncChunkRecord>(
+        let needed_chunk_durable_ids = manifest
+            .chunks
+            .iter()
+            .filter(|descriptor| {
+                !chunks_by_hash.contains_key(&descriptor.hash)
+                    && !descriptor
+                        .blob_hash
+                        .as_ref()
+                        .map(|hash| staged_blob_hashes.contains(hash))
+                        .unwrap_or(false)
+            })
+            .map(|descriptor| {
+                format!(
+                    "{}_{}",
+                    session_id,
+                    BlobChunkId::from_hash(&descriptor.hash)
+                )
+            })
+            .collect::<Vec<_>>();
+        for (_, record) in durable_get_resources_batch::<SyncChunkRecord>(
+            &state,
+            Some(&repository_id),
+            "sync_chunk",
+            &needed_chunk_durable_ids,
+        )
+        .await?
+        {
+            chunks_by_hash.insert(record.chunk.hash.clone(), record.bytes);
+        }
+        let needed_blob_durable_ids = {
+            let registry = state
+                .registry
+                .read()
+                .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+            bundle
+                .blobs
+                .iter()
+                .filter(|blob| {
+                    blob.bytes.is_empty()
+                        && !registry
+                            .staged_blob_uploads
+                            .contains_key(&(session_id.clone(), blob.blob.id.clone()))
+                })
+                .map(|blob| format!("{}_{}", session_id, blob.blob.id))
+                .collect::<Vec<_>>()
+        };
+        let mut durable_staged_uploads: BTreeMap<String, StagedBlobUpload> =
+            durable_get_resources_batch::<StagedBlobUpload>(
                 &state,
                 Some(&repository_id),
-                "sync_chunk",
-                &format!("{}_{}", session_id, chunk_id),
+                "staged_blob_upload",
+                &needed_blob_durable_ids,
             )
             .await?
-            {
-                chunks_by_hash.insert(record.chunk.hash.clone(), record.bytes);
-            }
-        }
+            .into_iter()
+            .collect();
         for blob in &mut bundle.blobs {
             if blob.bytes.is_empty() {
                 let memory_upload = state
@@ -4720,13 +5865,7 @@ async fn commit_sync_session(
                 let staged_upload = if let Some(upload) = memory_upload {
                     Some(upload)
                 } else {
-                    durable_get_resource::<StagedBlobUpload>(
-                        &state,
-                        Some(&repository_id),
-                        "staged_blob_upload",
-                        &format!("{}_{}", session_id, blob.blob.id),
-                    )
-                    .await?
+                    durable_staged_uploads.remove(&format!("{}_{}", session_id, blob.blob.id))
                 };
                 if let Some(upload) = staged_upload {
                     if upload.received_bytes != blob.blob.size_bytes
@@ -4900,7 +6039,18 @@ async fn get_sync_bundle(
 ) -> Result<Json<RegistrySyncBundle>, ApiError> {
     let repository_id = RepositoryId::new(repository_id);
     ensure_repo(&state, &repository_id)?;
-    let (refs, snapshots, changesets, proposals, operations, git_migration_records, cached_blobs) = {
+    let (
+        refs,
+        snapshots,
+        changesets,
+        proposals,
+        operations,
+        git_migration_records,
+        environment_variables,
+        environment_variable_versions,
+        environments,
+        cached_blobs,
+    ) = {
         let registry = state
             .registry
             .read()
@@ -4941,6 +6091,24 @@ async fn get_sync_bundle(
             .filter(|record| record.repository_id == repository_id)
             .cloned()
             .collect::<Vec<_>>();
+        let environment_variables = registry
+            .environment_variables
+            .values()
+            .filter(|variable| variable.repository_id == repository_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let environment_variable_versions = registry
+            .environment_variable_versions
+            .values()
+            .filter(|version| version.repository_id == repository_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let environments = registry
+            .environments
+            .values()
+            .filter(|environment| environment.repository_id == repository_id)
+            .cloned()
+            .collect::<Vec<_>>();
         let reachable_hashes = snapshots
             .iter()
             .flat_map(|snapshot| snapshot.entries.iter())
@@ -4957,32 +6125,13 @@ async fn get_sync_bundle(
             proposals,
             operations,
             git_migration_records,
+            environment_variables,
+            environment_variable_versions,
+            environments,
             cached_blobs,
         )
     };
-    let mut blobs = Vec::new();
-    for (blob, cached_bytes) in cached_blobs {
-        if blob.size_bytes > MAX_IN_MEMORY_BLOB_BYTES {
-            blobs.push(RegistryBlobRecord {
-                blob,
-                bytes: Vec::new(),
-            });
-            continue;
-        }
-        let bytes = if cached_bytes.is_empty() {
-            if let Some(blob_store) = &state.blob_store {
-                blob_store
-                    .get(&blob.hash)
-                    .await
-                    .map_err(storage_api_error)?
-            } else {
-                cached_bytes
-            }
-        } else {
-            cached_bytes
-        };
-        blobs.push(RegistryBlobRecord { blob, bytes });
-    }
+    let blobs = fetch_bundle_blobs_from_store(&state, cached_blobs).await?;
     Ok(Json(RegistrySyncBundle {
         repository_id,
         default_ref: "main".to_string(),
@@ -4992,6 +6141,9 @@ async fn get_sync_bundle(
         proposals,
         operations,
         git_migration_records,
+        environment_variables,
+        environment_variable_versions,
+        environments,
         blobs,
     }))
 }
@@ -5065,10 +6217,20 @@ async fn create_build_projection(
 ) -> Result<Json<BuildProjectionResponse>, ApiError> {
     let repository_id = RepositoryId::new(repository_id);
     ensure_repo(&state, &repository_id)?;
+    let response = execute_create_build_projection(&state, repository_id, request).await?;
+    Ok(Json(response))
+}
+
+async fn execute_create_build_projection(
+    state: &AppState,
+    repository_id: RepositoryId,
+    request: BuildProjectionRequest,
+) -> Result<BuildProjectionResponse, ApiError> {
     if request.environment.repository_id != repository_id {
         return Err(ApiError::bad_request("environment repository mismatch"));
     }
-    let snapshot = get_snapshot_from_state(&state, request.snapshot_id.clone())?;
+    let snapshot =
+        get_snapshot_for_repository(state, &repository_id, request.snapshot_id.clone()).await?;
     if snapshot.repository_id != repository_id {
         return Err(ApiError::bad_request("snapshot repository mismatch"));
     }
@@ -5099,10 +6261,17 @@ async fn create_build_projection(
         let evaluation = engine.evaluate(&PolicyRequest {
             repository_id: repository_id.clone(),
             actor: request.actor.clone(),
+            token_id: None,
             environment: Some(request.environment.clone()),
             action: PolicyAction::ReadBuildSource,
             object: PolicyObject::Path(entry.path.clone()),
             path: Some(entry.path.clone()),
+            key: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            deploy_source: None,
         });
         path_decisions.insert(entry.path.clone(), evaluation.decision.clone());
         actions.push(BuildProjectionAction {
@@ -5150,14 +6319,359 @@ async fn create_build_projection(
         .map_err(|_| ApiError::internal("registry lock poisoned"))?
         .projections
         .insert(plan.projection.id.clone(), plan.projection.clone());
-    persist_state(&state).await?;
+    persist_state(state).await?;
 
-    Ok(Json(BuildProjectionResponse {
+    Ok(BuildProjectionResponse {
         blocked: plan.has_blockers(),
         projection: plan.projection,
         manifest: plan.manifest,
         actions,
+    })
+}
+
+fn galaxy_default_ref_name() -> &'static str {
+    "main"
+}
+
+fn schedule_auto_deploys_for_ref(state: AppState, repository_id: RepositoryId, reference: Ref) {
+    if reference.name != galaxy_default_ref_name() {
+        tracing::debug!(
+            repository_id = %repository_id,
+            ref_name = %reference.name,
+            "skipping auto-deploy; ref is not the galaxy default"
+        );
+        return;
+    }
+    tracing::info!(
+        repository_id = %repository_id,
+        ref_name = %reference.name,
+        "scheduling push auto-deploys for default ref update"
+    );
+    tokio::spawn(async move {
+        if let Err(error) =
+            run_auto_deploys_for_default_ref(&state, &repository_id, &reference).await
+        {
+            tracing::warn!(
+                error = %error.message,
+                repository_id = %repository_id,
+                ref_name = %reference.name,
+                "auto-deploy after put_ref failed"
+            );
+        }
+    });
+}
+
+async fn run_auto_deploys_for_default_ref(
+    state: &AppState,
+    repository_id: &RepositoryId,
+    reference: &Ref,
+) -> Result<(), ApiError> {
+    let snapshot_id = resolve_ref_snapshot_id(state, repository_id, reference).await?;
+    let configs = auto_deploy_configs_for_repo(state, repository_id).await?;
+    if configs.is_empty() {
+        tracing::info!(
+            repository_id = %repository_id,
+            "no horizon auto-deploy configs registered for galaxy"
+        );
+        return Ok(());
+    }
+    tracing::info!(
+        repository_id = %repository_id,
+        snapshot_id = %snapshot_id,
+        config_count = configs.len(),
+        "running push auto-deploys"
+    );
+
+    for config in configs {
+        if let Err(error) =
+            auto_deploy_for_config(state, repository_id, reference, &snapshot_id, &config).await
+        {
+            tracing::warn!(
+                error = %error.message,
+                repository_id = %repository_id,
+                service_id = %config.service_id,
+                snapshot_id = %snapshot_id,
+                "failed to create push auto-deploy intent"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn auto_deploy_configs_for_repo(
+    state: &AppState,
+    repository_id: &RepositoryId,
+) -> Result<Vec<RepositoryDeployConfig>, ApiError> {
+    let mut configs = {
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        registry
+            .deploy_configs
+            .iter()
+            .filter(|((id, _), config)| {
+                id == repository_id
+                    && config.auto_deploy
+                    && config.provider_key.eq_ignore_ascii_case("horizon")
+            })
+            .map(|(_, config)| config.clone())
+            .collect::<Vec<_>>()
+    };
+    if !configs.is_empty() {
+        return Ok(configs);
+    }
+
+    // Durable store is the source of truth across restarts; memory may be cold.
+    if let Some(store) = &state.durable_store {
+        let resources = store
+            .list_resources_scoped(Some(repository_id), "deploy_config")
+            .await
+            .map_err(storage_api_error)?;
+        for value in resources {
+            let config: RepositoryDeployConfig =
+                serde_json::from_value(value).map_err(|error| {
+                    ApiError::internal(format!("failed to decode deploy config: {error}"))
+                })?;
+            if config.repository_id == *repository_id
+                && config.auto_deploy
+                && config.provider_key.eq_ignore_ascii_case("horizon")
+            {
+                state
+                    .registry
+                    .write()
+                    .map_err(|_| ApiError::internal("registry lock poisoned"))?
+                    .deploy_configs
+                    .insert(
+                        (config.repository_id.clone(), config.service_id.clone()),
+                        config.clone(),
+                    );
+                configs.push(config);
+            }
+        }
+    }
+    Ok(configs)
+}
+
+async fn auto_deploy_for_config(
+    state: &AppState,
+    repository_id: &RepositoryId,
+    reference: &Ref,
+    snapshot_id: &TreeSnapshotId,
+    config: &RepositoryDeployConfig,
+) -> Result<(), ApiError> {
+    if has_inflight_deploy_intent(state, &config.service_id, snapshot_id)? {
+        tracing::info!(
+            repository_id = %repository_id,
+            service_id = %config.service_id,
+            snapshot_id = %snapshot_id,
+            "skipping push auto-deploy; identical intent already in flight"
+        );
+        return Ok(());
+    }
+
+    let environment = resolve_auto_deploy_environment(state, repository_id, config)?;
+    let projection_response = execute_create_build_projection(
+        state,
+        repository_id.clone(),
+        BuildProjectionRequest {
+            snapshot_id: snapshot_id.clone(),
+            environment: environment.clone(),
+            actor: Actor::Integration("horizon".to_string()),
+            target: ProjectionTarget::Ci("horizon".to_string()),
+            path_scope: config.context_path.clone(),
+        },
+    )
+    .await?;
+    if projection_response.blocked {
+        return Err(ApiError::bad_request(
+            "build projection blocked; skipping push auto-deploy",
+        ));
+    }
+
+    execute_create_deploy_intent(
+        state,
+        repository_id.clone(),
+        CreateDeployIntentRequest {
+            projection_id: projection_response.projection.id,
+            environment_id: environment.id,
+            requested_provider_key: "horizon".to_string(),
+            requested_by: Actor::Integration("horizon".to_string()),
+            target: Some(DeployTarget {
+                provider_key: config.provider_key.clone(),
+                service_id: config.service_id.clone(),
+                environment_name: config
+                    .environment_name
+                    .clone()
+                    .or(Some(environment.name.clone())),
+                context_path: config.context_path.clone(),
+            }),
+            release_gate_id: None,
+            trigger_source: Some(DeployTriggerSource {
+                kind: "push".to_string(),
+                installation_id: None,
+                event_id: None,
+                reference: Some(reference.name.clone()),
+            }),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+fn has_inflight_deploy_intent(
+    state: &AppState,
+    service_id: &str,
+    snapshot_id: &TreeSnapshotId,
+) -> Result<bool, ApiError> {
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+    Ok(registry.deploy_intents.values().any(|intent| {
+        intent.snapshot_id == *snapshot_id
+            && intent
+                .target
+                .as_ref()
+                .is_some_and(|target| target.service_id == service_id)
+            && matches!(
+                intent.state,
+                DeployIntentState::Queued
+                    | DeployIntentState::SentToAstracollab
+                    | DeployIntentState::Running
+            )
     }))
+}
+
+fn resolve_auto_deploy_environment(
+    state: &AppState,
+    repository_id: &RepositoryId,
+    config: &RepositoryDeployConfig,
+) -> Result<Environment, ApiError> {
+    let registry = state
+        .registry
+        .read()
+        .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+    let repo_environments = registry
+        .environments
+        .values()
+        .filter(|environment| &environment.repository_id == repository_id)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if let Some(environment_id) = &config.environment_id {
+        if let Some(environment) = repo_environments
+            .iter()
+            .find(|environment| &environment.id == environment_id)
+        {
+            return Ok(environment.clone());
+        }
+        return Ok(Environment {
+            id: environment_id.clone(),
+            repository_id: repository_id.clone(),
+            name: config
+                .environment_name
+                .clone()
+                .unwrap_or_else(|| environment_id.as_str().to_string()),
+            kind: EnvironmentKind::Custom(
+                config
+                    .environment_name
+                    .clone()
+                    .unwrap_or_else(|| "production".to_string()),
+            ),
+        });
+    }
+
+    if let Some(name) = &config.environment_name
+        && let Some(environment) = repo_environments
+            .iter()
+            .find(|environment| environment.name.eq_ignore_ascii_case(name))
+    {
+        return Ok(environment.clone());
+    }
+
+    repo_environments.into_iter().next().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "no nebula environment available for auto-deploy of service {}",
+            config.service_id
+        ))
+    })
+}
+
+async fn resolve_ref_snapshot_id(
+    state: &AppState,
+    repository_id: &RepositoryId,
+    reference: &Ref,
+) -> Result<TreeSnapshotId, ApiError> {
+    let snapshot_id = {
+        let registry = state
+            .registry
+            .read()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?;
+        match &reference.target {
+            RefTarget::Snapshot(id) => Some(id.clone()),
+            RefTarget::ChangeSet(id) => registry
+                .changesets
+                .get(id)
+                .map(|changeset| changeset.next_snapshot_id.clone()),
+            RefTarget::Proposal(id) => {
+                let proposal = registry.proposals.get(id);
+                proposal.and_then(|proposal| {
+                    let changeset_id = proposal.changeset_ids.last()?;
+                    registry
+                        .changesets
+                        .get(changeset_id)
+                        .map(|changeset| changeset.next_snapshot_id.clone())
+                })
+            }
+        }
+    };
+
+    let snapshot_id = if let Some(snapshot_id) = snapshot_id {
+        snapshot_id
+    } else {
+        // Fall back to durable store for changesets/proposals not yet in memory.
+        match &reference.target {
+            RefTarget::Snapshot(id) => id.clone(),
+            RefTarget::ChangeSet(id) => {
+                let changeset = durable_get_resource::<ChangeSet>(
+                    state,
+                    Some(repository_id),
+                    "changeset",
+                    id.as_str(),
+                )
+                .await?
+                .ok_or_else(|| ApiError::not_found("changeset not found for ref target"))?;
+                changeset.next_snapshot_id
+            }
+            RefTarget::Proposal(id) => {
+                let proposal = durable_get_resource::<Proposal>(
+                    state,
+                    Some(repository_id),
+                    "proposal",
+                    id.as_str(),
+                )
+                .await?
+                .ok_or_else(|| ApiError::not_found("proposal not found for ref target"))?;
+                let changeset_id = proposal.changeset_ids.last().ok_or_else(|| {
+                    ApiError::bad_request("proposal has no changesets to resolve snapshot")
+                })?;
+                let changeset = durable_get_resource::<ChangeSet>(
+                    state,
+                    Some(repository_id),
+                    "changeset",
+                    changeset_id.as_str(),
+                )
+                .await?
+                .ok_or_else(|| ApiError::not_found("changeset not found for proposal"))?;
+                changeset.next_snapshot_id
+            }
+        }
+    };
+
+    // Ensure the snapshot is available for projection (memory or durable).
+    let _ = get_snapshot_for_repository(state, repository_id, snapshot_id.clone()).await?;
+    Ok(snapshot_id)
 }
 
 fn ensure_repo(state: &AppState, repository_id: &RepositoryId) -> Result<(), ApiError> {
@@ -5237,6 +6751,51 @@ async fn durable_delete_resource(
         .map_err(storage_api_error)
 }
 
+/// Batched variant of `durable_get_resource`: looks up every id in one round trip
+/// and returns (id, value) pairs for the ones found.
+async fn durable_get_resources_batch<T: DeserializeOwned>(
+    state: &AppState,
+    repository_id: Option<&RepositoryId>,
+    kind: &str,
+    ids: &[String],
+) -> Result<Vec<(String, T)>, ApiError> {
+    let Some(store) = &state.durable_store else {
+        return Ok(Vec::new());
+    };
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    store
+        .get_resources_scoped_batch(repository_id, kind, ids)
+        .await
+        .map_err(storage_api_error)?
+        .into_iter()
+        .map(|(id, value)| {
+            serde_json::from_value(value)
+                .map(|decoded| (id, decoded))
+                .map_err(|error| ApiError::internal(format!("failed to decode {kind}: {error}")))
+        })
+        .collect()
+}
+
+async fn durable_delete_resources_batch(
+    state: &AppState,
+    repository_id: Option<&RepositoryId>,
+    kind: &str,
+    ids: &[String],
+) -> Result<(), ApiError> {
+    let Some(store) = &state.durable_store else {
+        return Ok(());
+    };
+    if ids.is_empty() {
+        return Ok(());
+    }
+    store
+        .delete_resources_batch(repository_id, kind, ids)
+        .await
+        .map_err(storage_api_error)
+}
+
 async fn persist_sync_session_state(
     state: &AppState,
     session: &SyncSession,
@@ -5287,18 +6846,25 @@ async fn get_deploy_archive(
         return Err(ApiError::bad_request("deploy archive URL has expired"));
     }
 
-    let cache_key = deploy_archive_cache_key(&repository_id, &intent_id);
-    let bytes = state
+    let intent = deploy_intent_for_archive(&state, &repository_id, &intent_id).await?;
+    let cache_key = deploy_archive_cache_key(&repository_id, &intent.snapshot_id);
+    let cached = state
         .deploy_archive_cache
         .read()
         .map_err(|_| ApiError::internal("deploy archive cache lock poisoned"))?
         .get(&cache_key)
         .cloned();
-    let bytes = if let Some(bytes) = bytes {
+    let bytes = if let Some(bytes) = cached {
         bytes
     } else {
-        let intent = deploy_intent_for_archive(&state, &repository_id, &intent_id).await?;
-        Arc::new(build_deploy_archive(&state, &repository_id, &intent.projection_id).await?)
+        let built =
+            Arc::new(build_deploy_archive(&state, &repository_id, &intent.projection_id).await?);
+        state
+            .deploy_archive_cache
+            .write()
+            .map_err(|_| ApiError::internal("deploy archive cache lock poisoned"))?
+            .insert(cache_key, built.clone());
+        built
     };
 
     Response::builder()
@@ -5317,18 +6883,28 @@ async fn deploy_archive_artifact(
     repository_id: &RepositoryId,
     intent: &DeployIntent,
 ) -> Result<(String, String), ApiError> {
-    let bytes = build_deploy_archive(state, repository_id, &intent.projection_id).await?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let digest = hex::encode(hasher.finalize());
-    state
+    let cache_key = deploy_archive_cache_key(repository_id, &intent.snapshot_id);
+    let cached = state
         .deploy_archive_cache
-        .write()
+        .read()
         .map_err(|_| ApiError::internal("deploy archive cache lock poisoned"))?
-        .insert(
-            deploy_archive_cache_key(repository_id, &intent.id),
-            Arc::new(bytes),
-        );
+        .get(&cache_key)
+        .cloned();
+    let bytes = if let Some(bytes) = cached {
+        bytes
+    } else {
+        let built =
+            Arc::new(build_deploy_archive(state, repository_id, &intent.projection_id).await?);
+        state
+            .deploy_archive_cache
+            .write()
+            .map_err(|_| ApiError::internal("deploy archive cache lock poisoned"))?
+            .insert(cache_key, built.clone());
+        built
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(bytes.as_ref());
+    let digest = hex::encode(hasher.finalize());
     let expires_unix_ms = now_unix_ms() + 10 * 60 * 1000;
     let signature = sign_deploy_archive(state, repository_id, &intent.id, expires_unix_ms)?;
     let path = format!(
@@ -5343,8 +6919,8 @@ async fn deploy_archive_artifact(
     Ok((uri, digest))
 }
 
-fn deploy_archive_cache_key(repository_id: &RepositoryId, intent_id: &DeployIntentId) -> String {
-    format!("{repository_id}:{intent_id}")
+fn deploy_archive_cache_key(repository_id: &RepositoryId, snapshot_id: &TreeSnapshotId) -> String {
+    format!("{repository_id}:{snapshot_id}")
 }
 
 async fn deploy_intent_for_archive(
@@ -5432,18 +7008,27 @@ async fn build_deploy_archive(
     let snapshot =
         get_snapshot_for_repository(state, repository_id, projection.snapshot_id).await?;
 
+    let archive_entries: Vec<_> = snapshot
+        .entries
+        .iter()
+        .filter(|entry| !matches!(entry.kind, TreeEntryKind::Directory) && entry.hash.is_some())
+        .collect();
+
+    let mut fetched_bytes = Vec::with_capacity(archive_entries.len());
+    for chunk in archive_entries.chunks(BLOB_FETCH_CONCURRENCY) {
+        let bytes = futures::future::try_join_all(
+            chunk
+                .iter()
+                .map(|entry| blob_bytes_for_archive(state, entry.hash.as_ref().unwrap())),
+        )
+        .await?;
+        fetched_bytes.extend(bytes);
+    }
+
     let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut tar = TarBuilder::new(&mut gzip);
-        for entry in snapshot
-            .entries
-            .iter()
-            .filter(|entry| !matches!(entry.kind, TreeEntryKind::Directory))
-        {
-            let Some(hash) = &entry.hash else {
-                continue;
-            };
-            let bytes = blob_bytes_for_archive(state, hash).await?;
+        for (entry, bytes) in archive_entries.iter().zip(fetched_bytes.iter()) {
             let mut header = TarHeader::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(if matches!(entry.kind, TreeEntryKind::Executable) {
@@ -5546,25 +7131,21 @@ async fn cleanup_sync_artifacts(
         }
     };
     if let Some(manifest) = manifest {
-        for chunk in &manifest.chunks {
-            let chunk_id = BlobChunkId::from_hash(&chunk.hash);
-            durable_delete_resource(
-                state,
-                Some(repository_id),
-                "sync_chunk",
-                &format!("{}_{}", session_id, chunk_id),
-            )
+        let chunk_ids = manifest
+            .chunks
+            .iter()
+            .map(|chunk| format!("{}_{}", session_id, BlobChunkId::from_hash(&chunk.hash)))
+            .collect::<Vec<_>>();
+        let blob_ids = manifest
+            .chunks
+            .iter()
+            .filter_map(|chunk| chunk.blob_hash.as_ref())
+            .map(|blob_hash| format!("{}_{}", session_id, BlobId::from_hash(blob_hash)))
+            .collect::<Vec<_>>();
+        durable_delete_resources_batch(state, Some(repository_id), "sync_chunk", &chunk_ids)
             .await?;
-            if let Some(blob_hash) = &chunk.blob_hash {
-                durable_delete_resource(
-                    state,
-                    Some(repository_id),
-                    "staged_blob_upload",
-                    &format!("{}_{}", session_id, BlobId::from_hash(blob_hash)),
-                )
-                .await?;
-            }
-        }
+        durable_delete_resources_batch(state, Some(repository_id), "staged_blob_upload", &blob_ids)
+            .await?;
     }
     durable_delete_resource(
         state,
@@ -5737,6 +7318,9 @@ async fn hydrate_registry_from_store(
             .or_insert_with(|| (blob, Vec::new()));
     })
     .await?;
+    // Keyed off the record itself rather than its storage id, so manifests
+    // written before ids were scoped per repository (see `oci_manifest_id`)
+    // still load into the right slot.
     load_resources(
         store,
         registry,
@@ -5856,6 +7440,39 @@ async fn hydrate_registry_from_store(
     load_resources(
         store,
         registry,
+        "environment_variable",
+        |registry, variable: EnvironmentVariable| {
+            registry
+                .environment_variables
+                .insert(variable.id.clone(), variable);
+        },
+    )
+    .await?;
+    load_resources(
+        store,
+        registry,
+        "environment_variable_version",
+        |registry, version: EnvironmentVariableVersion| {
+            registry
+                .environment_variable_versions
+                .insert(version.id.clone(), version);
+        },
+    )
+    .await?;
+    load_resources(
+        store,
+        registry,
+        "environment_variable_change",
+        |registry, change: EnvironmentVariableChange| {
+            registry
+                .environment_variable_changes
+                .insert(change.id.clone(), change);
+        },
+    )
+    .await?;
+    load_resources(
+        store,
+        registry,
         "integration",
         |registry, integration: IntegrationActor| {
             registry
@@ -5941,6 +7558,18 @@ async fn hydrate_registry_from_store(
         "deploy_intent",
         |registry, intent: DeployIntent| {
             registry.deploy_intents.insert(intent.id.clone(), intent);
+        },
+    )
+    .await?;
+    load_resources(
+        store,
+        registry,
+        "deploy_config",
+        |registry, config: RepositoryDeployConfig| {
+            registry.deploy_configs.insert(
+                (config.repository_id.clone(), config.service_id.clone()),
+                config,
+            );
         },
     )
     .await?;
@@ -6067,6 +7696,13 @@ where
 }
 
 async fn persist_state(state: &AppState) -> Result<(), ApiError> {
+    // When Postgres is configured it is the source of truth. Skipping the file
+    // snapshot avoids cloning/pretty-printing the whole registry (OOM risk) and
+    // prevents a truncated registry.json from masking durable state.
+    if state.durable_store.is_some() {
+        return Ok(());
+    }
+
     let (registry, path) = {
         let registry = state
             .registry
@@ -6200,46 +7836,46 @@ async fn oci_start_upload(
     }
 
     let query_params = parse_query_params(query);
-    if let Some(mount) = query_params.get("mount") {
-        if validate_oci_digest(mount).is_ok() {
-            let blob = {
-                let registry = state.registry.read().unwrap();
-                registry.oci_blobs.get(mount).cloned()
+    if let Some(mount) = query_params.get("mount")
+        && validate_oci_digest(mount).is_ok()
+    {
+        let blob = {
+            let registry = state.registry.read().unwrap();
+            registry.oci_blobs.get(mount).cloned()
+        };
+        if let Some((blob, bytes)) = blob {
+            let now = now_unix_ms();
+            let mounted = OciBlob {
+                repository_name: repository.clone(),
+                repository_name_normalized: repository.clone(),
+                updated_at_unix_ms: now,
+                ..blob
             };
-            if let Some((blob, bytes)) = blob {
-                let now = now_unix_ms();
-                let mounted = OciBlob {
-                    repository_name: repository.clone(),
-                    repository_name_normalized: repository.clone(),
-                    updated_at_unix_ms: now,
-                    ..blob
-                };
-                {
-                    let mut registry = state.registry.write().unwrap();
-                    registry.oci_blobs.insert(mount.clone(), (mounted, bytes));
-                }
-                if let Err(error) = persist_state(&state).await {
-                    return error.into_response();
-                }
-                let mut response_headers = HeaderMap::new();
-                insert_header(
-                    &mut response_headers,
-                    "location",
-                    format!("/v2/{repository}/blobs/{mount}"),
-                );
-                insert_header(
-                    &mut response_headers,
-                    "docker-content-digest",
-                    mount.clone(),
-                );
-                return oci_empty_response(StatusCode::CREATED, response_headers);
+            {
+                let mut registry = state.registry.write().unwrap();
+                registry.oci_blobs.insert(mount.clone(), (mounted, bytes));
             }
+            if let Err(error) = persist_state(&state).await {
+                return error.into_response();
+            }
+            let mut response_headers = HeaderMap::new();
+            insert_header(
+                &mut response_headers,
+                "location",
+                format!("/v2/{repository}/blobs/{mount}"),
+            );
+            insert_header(
+                &mut response_headers,
+                "docker-content-digest",
+                mount.clone(),
+            );
+            return oci_empty_response(StatusCode::CREATED, response_headers);
         }
     }
-    if let Some(digest) = query_params.get("digest") {
-        if !body.is_empty() {
-            return oci_finalize_monolithic_upload(state, repository, digest, body).await;
-        }
+    if let Some(digest) = query_params.get("digest")
+        && !body.is_empty()
+    {
+        return oci_finalize_monolithic_upload(state, repository, digest, body).await;
     }
 
     let now = now_unix_ms();
@@ -6264,12 +7900,11 @@ async fn oci_start_upload(
         let registry = state.registry.read().unwrap();
         registry.oci_upload_sessions.get(&uuid).cloned()
     };
-    if let Some(session) = session {
-        if let Err(error) =
+    if let Some(session) = session
+        && let Err(error) =
             durable_put_resource(&state, None, "oci_upload_session", &uuid, &session).await
-        {
-            return error.into_response();
-        }
+    {
+        return error.into_response();
     }
     if let Err(error) = persist_state(&state).await {
         return error.into_response();
@@ -6278,7 +7913,7 @@ async fn oci_start_upload(
     insert_header(
         &mut response_headers,
         "location",
-        oci_upload_location(&state, &repository, &uuid),
+        oci_upload_location(&repository, &uuid),
     );
     insert_header(&mut response_headers, "range", "0-0");
     insert_header(&mut response_headers, "docker-upload-uuid", uuid);
@@ -6329,7 +7964,7 @@ async fn oci_upload_session(
             insert_header(
                 &mut response_headers,
                 "location",
-                oci_upload_location(&state, &repository, upload_uuid),
+                oci_upload_location(&repository, upload_uuid),
             );
             insert_header(
                 &mut response_headers,
@@ -6362,7 +7997,7 @@ async fn oci_upload_session(
             insert_header(
                 &mut response_headers,
                 "location",
-                oci_upload_location(&state, &repository, upload_uuid),
+                oci_upload_location(&repository, upload_uuid),
             );
             insert_header(
                 &mut response_headers,
@@ -6483,10 +8118,10 @@ async fn oci_store_blob(
             "uploaded bytes do not match requested digest",
         );
     }
-    if let Some(blob_store) = &state.blob_store {
-        if let Err(error) = blob_store.put(&computed, &bytes).await {
-            return storage_api_error(error).into_response();
-        }
+    if let Some(blob_store) = &state.blob_store
+        && let Err(error) = blob_store.put(&computed, &bytes).await
+    {
+        return storage_api_error(error).into_response();
     }
     let now = now_unix_ms();
     let blob = OciBlob {
@@ -6515,10 +8150,10 @@ async fn oci_store_blob(
         let registry = state.registry.read().unwrap();
         registry.oci_blobs.get(digest).map(|(blob, _)| blob.clone())
     };
-    if let Some(blob) = blob {
-        if let Err(error) = durable_put_resource(state, None, "oci_blob", digest, &blob).await {
-            return error.into_response();
-        }
+    if let Some(blob) = blob
+        && let Err(error) = durable_put_resource(state, None, "oci_blob", digest, &blob).await
+    {
+        return error.into_response();
     }
     if let Err(error) = persist_state(state).await {
         return error.into_response();
@@ -6552,16 +8187,6 @@ async fn oci_blob(
     let Some((blob, mut bytes)) = blob else {
         return oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "unknown blob");
     };
-    if bytes.is_empty() {
-        if let (Some(blob_store), Some(hash)) =
-            (&state.blob_store, content_hash_from_oci_digest(digest))
-        {
-            match blob_store.get(&hash).await {
-                Ok(stored_bytes) => bytes = stored_bytes,
-                Err(error) => return storage_api_error(error).into_response(),
-            }
-        }
-    }
     if method != Method::GET && method != Method::HEAD {
         return oci_error(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -6569,7 +8194,79 @@ async fn oci_blob(
             "unsupported blob method",
         );
     }
+
     let range_header = headers.get(header::RANGE);
+    let wants_range = range_header.is_some();
+    let hash = content_hash_from_oci_digest(digest);
+
+    // Stream full GETs from object store when bytes are not cached in memory.
+    if bytes.is_empty()
+        && !wants_range
+        && method == Method::GET
+        && let (Some(object_store), Some(hash)) = (&state.object_blob_store, hash.as_ref())
+    {
+        match object_store.get_byte_stream(hash).await {
+            Ok((size, byte_stream)) => {
+                let mut response_headers = HeaderMap::new();
+                insert_header(
+                    &mut response_headers,
+                    "docker-content-digest",
+                    digest.to_string(),
+                );
+                insert_header(&mut response_headers, "etag", format!(r#""{digest}""#));
+                insert_header(
+                    &mut response_headers,
+                    "cache-control",
+                    "public, max-age=31536000, immutable",
+                );
+                insert_header(
+                    &mut response_headers,
+                    "content-type",
+                    blob.media_type
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                );
+                insert_header(&mut response_headers, "content-length", size.to_string());
+                return oci_stream_response(StatusCode::OK, response_headers, byte_stream);
+            }
+            Err(error) => return storage_api_error(error).into_response(),
+        }
+    }
+
+    if bytes.is_empty()
+        && let (Some(blob_store), Some(hash)) = (&state.blob_store, hash.as_ref())
+    {
+        match blob_store.get(hash).await {
+            Ok(stored_bytes) => bytes = stored_bytes,
+            Err(error) => return storage_api_error(error).into_response(),
+        }
+    }
+    if bytes.is_empty()
+        && method == Method::HEAD
+        && let (Some(object_store), Some(hash)) = (&state.object_blob_store, hash.as_ref())
+    {
+        match object_store.object_size(hash).await {
+            Ok(Some(size)) => {
+                let mut response_headers = HeaderMap::new();
+                insert_header(
+                    &mut response_headers,
+                    "docker-content-digest",
+                    digest.to_string(),
+                );
+                insert_header(&mut response_headers, "etag", format!(r#""{digest}""#));
+                insert_header(
+                    &mut response_headers,
+                    "content-type",
+                    blob.media_type
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                );
+                insert_header(&mut response_headers, "content-length", size.to_string());
+                return oci_empty_response(StatusCode::OK, response_headers);
+            }
+            Ok(None) => return oci_error(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", "unknown blob"),
+            Err(error) => return storage_api_error(error).into_response(),
+        }
+    }
+
     let range = range_header
         .and_then(|value| value.to_str().ok())
         .and_then(|value| parse_byte_range(value, bytes.len() as u64));
@@ -6765,8 +8462,9 @@ async fn oci_manifest(
                 )
             };
             if let Some(manifest) = manifest {
+                let id = oci_manifest_id(&repository, &digest);
                 if let Err(error) =
-                    durable_put_resource(&state, None, "oci_manifest", &digest, &manifest).await
+                    durable_put_resource(&state, None, "oci_manifest", &id, &manifest).await
                 {
                     return error.into_response();
                 }
@@ -6777,12 +8475,11 @@ async fn oci_manifest(
                     return error.into_response();
                 }
             }
-            if let Some(provenance) = provenance {
-                if let Err(error) =
+            if let Some(provenance) = provenance
+                && let Err(error) =
                     durable_put_resource(&state, None, "oci_provenance", &digest, &provenance).await
-                {
-                    return error.into_response();
-                }
+            {
+                return error.into_response();
             }
             if let Err(error) = persist_state(&state).await {
                 return error.into_response();
@@ -7048,10 +8745,10 @@ async fn verify_oci_bearer(state: &AppState, token: &str) -> Result<VerifiedClai
     if let Some(provider) = &state.external_auth_provider {
         return provider.verify_bearer(token, None).await;
     }
-    if let Some(verifier) = &state.auth.verifier {
-        if let Ok(context) = verifier.verify_token(token).await {
-            return Ok(context.into());
-        }
+    if let Some(verifier) = &state.auth.verifier
+        && let Ok(context) = verifier.verify_token(token).await
+    {
+        return Ok(context.into());
     }
     verify_stored_api_token(state, token, None).map_err(|error| error.to_string())
 }
@@ -7070,6 +8767,7 @@ fn oci_action_name(action: &PolicyAction) -> &'static str {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_oci_repository_name(raw: &str) -> Result<String, Response> {
     let name = raw.trim_matches('/');
     if name.is_empty() || name.len() > 255 {
@@ -7108,6 +8806,7 @@ fn validate_oci_repository_name(raw: &str) -> Result<String, Response> {
     Ok(name.to_string())
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_oci_digest(raw: &str) -> Result<(), Response> {
     let Some(digest) = raw.strip_prefix("sha256:") else {
         return Err(oci_error(
@@ -7134,6 +8833,7 @@ fn content_hash_from_oci_digest(raw: &str) -> Option<ContentHash> {
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_oci_tag(raw: &str) -> Result<(), Response> {
     if raw.is_empty() || raw.len() > 128 || raw.starts_with('.') || raw.starts_with('-') {
         return Err(oci_error(
@@ -7166,6 +8866,7 @@ fn is_supported_manifest_media_type(media_type: &str) -> bool {
     )
 }
 
+#[allow(clippy::result_large_err)]
 fn collect_manifest_digests(bytes: &[u8]) -> Result<Vec<String>, Response> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| {
         oci_error(
@@ -7182,10 +8883,10 @@ fn collect_manifest_digests(bytes: &[u8]) -> Result<Vec<String>, Response> {
 fn collect_digest_values(value: &Value, digests: &mut BTreeSet<String>) {
     match value {
         Value::Object(map) => {
-            if let Some(Value::String(digest)) = map.get("digest") {
-                if validate_oci_digest(digest).is_ok() {
-                    digests.insert(digest.clone());
-                }
+            if let Some(Value::String(digest)) = map.get("digest")
+                && validate_oci_digest(digest).is_ok()
+            {
+                digests.insert(digest.clone());
             }
             for value in map.values() {
                 collect_digest_values(value, digests);
@@ -7279,12 +8980,14 @@ fn upload_range(received_bytes: u64) -> String {
     }
 }
 
-fn oci_upload_location(state: &AppState, repository: &str, upload_uuid: &str) -> String {
-    let path = format!("/v2/{repository}/blobs/uploads/{upload_uuid}");
-    match &state.public_base_url {
-        Some(base) => format!("{}{}", base.trim_end_matches('/'), path),
-        None => path,
-    }
+fn oci_upload_location(repository: &str, upload_uuid: &str) -> String {
+    // Deliberately relative, not built from public_base_url: OCI clients resolve a
+    // relative Location against whatever host they actually connected to. Emitting
+    // an absolute external URL here breaks in-cluster clients (e.g. BuildKit hitting
+    // the internal Service address), since most HTTP clients won't forward the
+    // Authorization header across a host change on redirect, silently turning the
+    // upload-continuation request unauthenticated.
+    format!("/v2/{repository}/blobs/uploads/{upload_uuid}")
 }
 
 fn request_actor(headers: &HeaderMap) -> Option<Actor> {
@@ -7377,6 +9080,19 @@ fn oci_body_response(status: StatusCode, mut headers: HeaderMap, body: Vec<u8>) 
     response
 }
 
+fn oci_stream_response<S>(status: StatusCode, mut headers: HeaderMap, stream: S) -> Response
+where
+    S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    headers.insert(
+        HeaderName::from_static("docker-distribution-api-version"),
+        HeaderValue::from_static("registry/2.0"),
+    );
+    let mut response = (status, Body::from_stream(stream)).into_response();
+    response.headers_mut().extend(headers);
+    response
+}
+
 fn insert_header(headers: &mut HeaderMap, name: &'static str, value: impl Into<String>) {
     if let Ok(value) = HeaderValue::from_str(&value.into()) {
         headers.insert(HeaderName::from_static(name), value);
@@ -7448,6 +9164,30 @@ fn transaction_from_sync_bundle(
             record,
         )?);
     }
+    for variable in &bundle.environment_variables {
+        mutations.push(registry_mutation(
+            Some(&variable.repository_id),
+            "environment_variable",
+            variable.id.as_str(),
+            variable,
+        )?);
+    }
+    for version in &bundle.environment_variable_versions {
+        mutations.push(registry_mutation(
+            Some(&version.repository_id),
+            "environment_variable_version",
+            version.id.as_str(),
+            version,
+        )?);
+    }
+    for environment in &bundle.environments {
+        mutations.push(registry_mutation(
+            Some(&environment.repository_id),
+            "environment",
+            environment.id.as_str(),
+            environment,
+        )?);
+    }
     Ok(RegistryTransaction {
         id: format!("tx_sync_{}_{}", bundle.repository_id, now_unix_ms()),
         repository_id: Some(bundle.repository_id.clone()),
@@ -7501,6 +9241,77 @@ fn apply_sync_bundle_to_registry(registry: &mut InMemoryRegistry, bundle: &Regis
             .git_migration_records
             .insert(record.id.clone(), record.clone());
     }
+    for variable in &bundle.environment_variables {
+        registry
+            .environment_variables
+            .insert(variable.id.clone(), variable.clone());
+    }
+    for version in &bundle.environment_variable_versions {
+        registry
+            .environment_variable_versions
+            .insert(version.id.clone(), version.clone());
+    }
+    for environment in &bundle.environments {
+        registry
+            .environments
+            .insert(environment.id.clone(), environment.clone());
+    }
+}
+
+const BLOB_PERSIST_CONCURRENCY: usize = 32;
+const BLOB_FETCH_CONCURRENCY: usize = 64;
+
+/// Resolves each blob's bytes (from the in-memory cache, or the object
+/// store when not cached) concurrently in bounded batches. `get_sync_bundle`
+/// used to await `blob_store.get()` one blob at a time in a plain `for`
+/// loop, which is a sequential round trip per blob to the object store —
+/// fine for a handful of blobs, but a full-bundle pull/clone of a
+/// thousand-plus-blob repository blew past the gateway timeout the same way
+/// the push-side N+1 (see `persist_bundle_blobs_to_store`) once did.
+async fn fetch_bundle_blobs_from_store(
+    state: &AppState,
+    cached_blobs: Vec<(ContentBlob, Vec<u8>)>,
+) -> Result<Vec<RegistryBlobRecord>, ApiError> {
+    let mut blobs = Vec::with_capacity(cached_blobs.len());
+    for chunk in cached_blobs.chunks(BLOB_FETCH_CONCURRENCY) {
+        let fetched = futures::future::try_join_all(
+            chunk
+                .iter()
+                .map(|(blob, cached_bytes)| fetch_one_bundle_blob(state, blob, cached_bytes)),
+        )
+        .await?;
+        blobs.extend(fetched);
+    }
+    Ok(blobs)
+}
+
+async fn fetch_one_bundle_blob(
+    state: &AppState,
+    blob: &ContentBlob,
+    cached_bytes: &[u8],
+) -> Result<RegistryBlobRecord, ApiError> {
+    if blob.size_bytes > MAX_IN_MEMORY_BLOB_BYTES {
+        return Ok(RegistryBlobRecord {
+            blob: blob.clone(),
+            bytes: Vec::new(),
+        });
+    }
+    let bytes = if cached_bytes.is_empty() {
+        if let Some(blob_store) = &state.blob_store {
+            blob_store
+                .get(&blob.hash)
+                .await
+                .map_err(storage_api_error)?
+        } else {
+            Vec::new()
+        }
+    } else {
+        cached_bytes.to_vec()
+    };
+    Ok(RegistryBlobRecord {
+        blob: blob.clone(),
+        bytes,
+    })
 }
 
 async fn persist_bundle_blobs_to_store(
@@ -7511,40 +9322,60 @@ async fn persist_bundle_blobs_to_store(
     let Some(blob_store) = &state.blob_store else {
         return Ok(());
     };
-    for record in &bundle.blobs {
-        if record.bytes.is_empty() {
-            if !verify_empty_blobs {
-                continue;
-            }
-            if blob_store
-                .exists(&record.blob.hash)
-                .await
-                .map_err(storage_api_error)?
-            {
-                continue;
-            }
-            return Err(ApiError::bad_request(format!(
-                "sync bundle is missing bytes for blob {}",
-                record.blob.hash.digest
-            )));
-        }
-        let computed = ContentHash::sha256(&record.bytes);
-        if computed != record.blob.hash {
-            return Err(ApiError::bad_request(format!(
-                "sync bundle blob checksum mismatch for {}",
-                record.blob.hash.digest
-            )));
-        }
-        blob_store
-            .put(&record.blob.hash, &record.bytes)
-            .await
-            .map_err(|error| {
-                ApiError::internal(format!(
-                    "failed to stage blob before metadata commit: {error}"
-                ))
-            })?;
+    for chunk in bundle.blobs.chunks(BLOB_PERSIST_CONCURRENCY) {
+        futures::future::try_join_all(
+            chunk.iter().map(|record| {
+                persist_blob_to_store(blob_store.as_ref(), record, verify_empty_blobs)
+            }),
+        )
+        .await?;
     }
     Ok(())
+}
+
+async fn persist_blob_to_store(
+    blob_store: &dyn BlobStore,
+    record: &RegistryBlobRecord,
+    verify_empty_blobs: bool,
+) -> Result<(), ApiError> {
+    if record.bytes.is_empty() {
+        if !verify_empty_blobs {
+            return Ok(());
+        }
+        if blob_store
+            .exists(&record.blob.hash)
+            .await
+            .map_err(storage_api_error)?
+        {
+            return Ok(());
+        }
+        return Err(ApiError::bad_request(format!(
+            "sync bundle is missing bytes for blob {}",
+            record.blob.hash.digest
+        )));
+    }
+    let computed = ContentHash::sha256(&record.bytes);
+    if computed != record.blob.hash {
+        return Err(ApiError::bad_request(format!(
+            "sync bundle blob checksum mismatch for {}",
+            record.blob.hash.digest
+        )));
+    }
+    if blob_store
+        .exists(&record.blob.hash)
+        .await
+        .map_err(storage_api_error)?
+    {
+        return Ok(());
+    }
+    blob_store
+        .put(&record.blob.hash, &record.bytes)
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "failed to stage blob before metadata commit: {error}"
+            ))
+        })
 }
 
 fn registry_mutation<T: Serialize>(
@@ -7732,12 +9563,415 @@ fn storage_api_error(error: NebulaError) -> ApiError {
     }
 }
 
-fn blob_id(hash: &ContentHash) -> String {
+async fn ensure_environment(
+    state: &AppState,
+    repository_id: &RepositoryId,
+    environment_id: &EnvironmentId,
+) -> Result<Environment, ApiError> {
+    if let Some(environment) = durable_get_resource::<Environment>(
+        state,
+        Some(repository_id),
+        "environment",
+        environment_id.as_str(),
+    )
+    .await?
+    {
+        return Ok(environment);
+    }
+    state
+        .registry
+        .read()
+        .map_err(|_| ApiError::internal("registry lock poisoned"))?
+        .environments
+        .get(environment_id)
+        .filter(|environment| &environment.repository_id == repository_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("environment not found"))
+}
+
+fn normalize_variable_key(raw: &str) -> Result<String, ApiError> {
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err(ApiError::bad_request("variable key is required"));
+    }
+    if !key
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(ApiError::bad_request(
+            "variable key must use uppercase letters, digits, and underscores",
+        ));
+    }
+    Ok(key.to_string())
+}
+
+fn default_variable_sensitivity(
+    key: &str,
+    environment_kind: &EnvironmentKind,
+) -> VariableSensitivity {
+    if matches!(
+        environment_kind,
+        EnvironmentKind::Production | EnvironmentKind::Staging
+    ) || likely_secret_key(key)
+    {
+        VariableSensitivity::Sensitive
+    } else {
+        VariableSensitivity::Encrypted
+    }
+}
+
+fn likely_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    key.ends_with("_SECRET")
+        || key.ends_with("_TOKEN")
+        || key.ends_with("_PRIVATE_KEY")
+        || key.contains("DATABASE_URL")
+        || key.contains("API_KEY")
+        || key.contains("PASSWORD")
+        || key.contains("CREDENTIAL")
+}
+
+fn default_variable_value_kind(
+    sensitivity: &VariableSensitivity,
+    reference: Option<&VariableReference>,
+) -> VariableValueKind {
+    if reference.is_some() {
+        VariableValueKind::Reference
+    } else if sensitivity.is_write_only() {
+        VariableValueKind::Secret
+    } else {
+        VariableValueKind::Literal
+    }
+}
+
+fn default_secret_storage_mode(
+    sensitivity: &VariableSensitivity,
+    value_kind: &VariableValueKind,
+) -> VariableSecretStorageMode {
+    if matches!(
+        value_kind,
+        VariableValueKind::Reference | VariableValueKind::ProviderRef
+    ) {
+        VariableSecretStorageMode::ExternalProvider
+    } else if matches!(sensitivity, VariableSensitivity::Public) {
+        VariableSecretStorageMode::MetadataOnly
+    } else {
+        VariableSecretStorageMode::RegistryEncrypted
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_environment_variable_version(
+    state: &AppState,
+    repository_id: &RepositoryId,
+    variable_id: &EnvironmentVariableId,
+    key: &str,
+    value_kind: &VariableValueKind,
+    sensitivity: &VariableSensitivity,
+    storage_mode: &VariableSecretStorageMode,
+    value: &str,
+    actor: Actor,
+) -> Result<EnvironmentVariableVersion, ApiError> {
+    let now = now_unix_ms();
+    let id = EnvironmentVariableVersionId::generated();
+    let fingerprint = Some(secret_fingerprint(state, key, value)?);
+    let value_digest = Some(ContentHash::sha256(value.as_bytes()).digest);
+    let mut version = EnvironmentVariableVersion {
+        id,
+        repository_id: repository_id.clone(),
+        variable_id: variable_id.clone(),
+        key: key.to_string(),
+        sensitivity: sensitivity.clone(),
+        value_kind: value_kind.clone(),
+        storage_mode: storage_mode.clone(),
+        plaintext_value: None,
+        ciphertext: None,
+        content_hash: None,
+        encryption_key_id: None,
+        wrapped_data_key: None,
+        nonce: None,
+        fingerprint,
+        value_digest,
+        redaction_tokens: if sensitivity.is_write_only() {
+            redaction_values(value)
+        } else {
+            Vec::new()
+        },
+        created_by: Some(actor),
+        created_at_unix_ms: now,
+        last_injected_at_unix_ms: None,
+        last_used_by_deploy_id: None,
+    };
+    if matches!(sensitivity, VariableSensitivity::Public)
+        && matches!(storage_mode, VariableSecretStorageMode::MetadataOnly)
+    {
+        version.plaintext_value = Some(value.to_string());
+        return Ok(version);
+    }
+    let encrypted = encrypt_secret_value(state, &version.id, key, value)?;
+    version.ciphertext = Some(encrypted.ciphertext.clone());
+    version.encryption_key_id = Some(encrypted.encryption_key_id);
+    version.wrapped_data_key = Some(encrypted.wrapped_data_key);
+    version.nonce = Some(encrypted.nonce);
+    if matches!(storage_mode, VariableSecretStorageMode::BlobBackedEncrypted) {
+        let bytes = encrypted.ciphertext.into_bytes();
+        let blob = ContentBlob::from_bytes(
+            &bytes,
+            Some("application/vnd.nebula.secret+ciphertext".to_string()),
+            BlobVisibility::Encrypted {
+                key_envelope_id: version
+                    .encryption_key_id
+                    .clone()
+                    .unwrap_or_else(|| "registry-local".to_string()),
+            },
+        );
+        if let Some(store) = &state.blob_store {
+            store.put(&blob.hash, &bytes).await.map_err(|error| {
+                ApiError::internal(format!("failed to persist secret blob: {error}"))
+            })?;
+        }
+        durable_put_resource(
+            state,
+            Some(repository_id),
+            "blob",
+            &blob_id(&blob.hash),
+            &blob,
+        )
+        .await?;
+        state
+            .registry
+            .write()
+            .map_err(|_| ApiError::internal("registry lock poisoned"))?
+            .blobs
+            .insert(blob.hash.clone(), (blob.clone(), bytes));
+        version.content_hash = Some(blob.hash);
+    }
+    Ok(version)
+}
+
+#[derive(Clone, Debug)]
+struct EncryptedSecretValue {
+    ciphertext: String,
+    encryption_key_id: String,
+    wrapped_data_key: String,
+    nonce: String,
+}
+
+fn encrypt_secret_value(
+    state: &AppState,
+    version_id: &EnvironmentVariableVersionId,
+    key: &str,
+    value: &str,
+) -> Result<EncryptedSecretValue, ApiError> {
+    let master = registry_secret_key(state);
+    let data_key =
+        ContentHash::sha256(format!("{}:{key}:data-key", version_id.as_str()).as_bytes()).digest;
+    let data_key_bytes = hex::decode(&data_key)
+        .map_err(|_| ApiError::internal("failed to derive secret data key"))?;
+    let nonce_digest =
+        ContentHash::sha256(format!("{}:{key}:nonce", version_id.as_str()).as_bytes()).digest;
+    let nonce_bytes = hex::decode(&nonce_digest[..24])
+        .map_err(|_| ApiError::internal("failed to derive secret nonce"))?;
+    let cipher = Aes256Gcm::new_from_slice(&data_key_bytes)
+        .map_err(|_| ApiError::internal("failed to initialize secret cipher"))?;
+    let nonce = Nonce::try_from(nonce_bytes.as_slice())
+        .map_err(|_| ApiError::internal("failed to derive secret nonce"))?;
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: value.as_bytes(),
+                aad: key.as_bytes(),
+            },
+        )
+        .map_err(|_| ApiError::internal("failed to encrypt secret value"))?;
+    Ok(EncryptedSecretValue {
+        ciphertext: hex::encode(ciphertext),
+        encryption_key_id: "registry-local-v1".to_string(),
+        wrapped_data_key: wrap_data_key(&master, &data_key_bytes)?,
+        nonce: hex::encode(nonce_bytes),
+    })
+}
+
+fn decrypt_environment_variable_value(
+    state: &AppState,
+    version: &EnvironmentVariableVersion,
+) -> Result<String, ApiError> {
+    if let Some(value) = &version.plaintext_value {
+        return Ok(value.clone());
+    }
+    let ciphertext = version
+        .ciphertext
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("environment variable value is encrypted externally"))?;
+    let nonce = version
+        .nonce
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("encrypted value is missing nonce"))?;
+    let wrapped_data_key = version
+        .wrapped_data_key
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("encrypted value is missing wrapped data key"))?;
+    let master = registry_secret_key(state);
+    let data_key = unwrap_data_key(&master, wrapped_data_key)?;
+    let ciphertext = hex::decode(ciphertext)
+        .map_err(|_| ApiError::internal("encrypted value has invalid ciphertext"))?;
+    let nonce =
+        hex::decode(nonce).map_err(|_| ApiError::internal("encrypted value has invalid nonce"))?;
+    let cipher = Aes256Gcm::new_from_slice(&data_key)
+        .map_err(|_| ApiError::internal("failed to initialize secret cipher"))?;
+    let nonce = Nonce::try_from(nonce.as_slice())
+        .map_err(|_| ApiError::internal("encrypted value has invalid nonce"))?;
+    let plaintext = cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: &ciphertext,
+                aad: version.key.as_bytes(),
+            },
+        )
+        .map_err(|_| ApiError::internal("failed to decrypt secret value"))?;
+    String::from_utf8(plaintext).map_err(|_| ApiError::internal("secret value is not valid UTF-8"))
+}
+
+fn registry_secret_key(state: &AppState) -> Vec<u8> {
+    let raw = state
+        .secret_encryption_key
+        .as_deref()
+        .or(state.astracollab_deploy_signing_secret.as_deref())
+        .or(state.telemetry_webhook_secret.as_deref())
+        .unwrap_or("nebula-registry-local-development-secret-encryption-key");
+    ContentHash::sha256(raw.as_bytes())
+        .digest
+        .as_bytes()
+        .chunks(2)
+        .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+        .filter_map(|hex| u8::from_str_radix(hex, 16).ok())
+        .collect()
+}
+
+fn wrap_data_key(master: &[u8], data_key: &[u8]) -> Result<String, ApiError> {
+    let cipher = Aes256Gcm::new_from_slice(master)
+        .map_err(|_| ApiError::internal("failed to initialize wrapping cipher"))?;
+    let nonce = Nonce::from([0_u8; 12]);
+    let wrapped = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: data_key,
+                aad: b"nebula-env-data-key",
+            },
+        )
+        .map_err(|_| ApiError::internal("failed to wrap secret data key"))?;
+    Ok(hex::encode(wrapped))
+}
+
+fn unwrap_data_key(master: &[u8], wrapped_data_key: &str) -> Result<Vec<u8>, ApiError> {
+    let cipher = Aes256Gcm::new_from_slice(master)
+        .map_err(|_| ApiError::internal("failed to initialize wrapping cipher"))?;
+    let nonce = Nonce::from([0_u8; 12]);
+    let wrapped = hex::decode(wrapped_data_key)
+        .map_err(|_| ApiError::internal("invalid wrapped secret data key"))?;
+    cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: &wrapped,
+                aad: b"nebula-env-data-key",
+            },
+        )
+        .map_err(|_| ApiError::internal("failed to unwrap secret data key"))
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn secret_fingerprint(state: &AppState, key: &str, value: &str) -> Result<String, ApiError> {
+    let mut mac = HmacSha256::new_from_slice(&registry_secret_key(state))
+        .map_err(|_| ApiError::internal("failed to initialize HMAC"))?;
+    mac.update(key.as_bytes());
+    mac.update(b"\0");
+    mac.update(value.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn variable_version_view(
+    version: &EnvironmentVariableVersion,
+    include_plaintext: bool,
+) -> EnvironmentVariableVersionView {
+    EnvironmentVariableVersionView {
+        id: version.id.clone(),
+        variable_id: version.variable_id.clone(),
+        key: version.key.clone(),
+        sensitivity: version.sensitivity.clone(),
+        value_kind: version.value_kind.clone(),
+        storage_mode: version.storage_mode.clone(),
+        masked_value: Some(masked_value(
+            &version.sensitivity,
+            version.fingerprint.as_deref(),
+        )),
+        plaintext_value: include_plaintext
+            .then(|| version.plaintext_value.clone())
+            .flatten(),
+        content_hash: version.content_hash.clone(),
+        encryption_key_id: version.encryption_key_id.clone(),
+        wrapped_data_key: version.wrapped_data_key.clone(),
+        nonce: version.nonce.clone(),
+        fingerprint: version.fingerprint.clone(),
+        value_digest: version.value_digest.clone(),
+        created_at_unix_ms: version.created_at_unix_ms,
+    }
+}
+
+fn masked_value(sensitivity: &VariableSensitivity, fingerprint: Option<&str>) -> String {
+    match sensitivity {
+        VariableSensitivity::Public => "[public]".to_string(),
+        VariableSensitivity::Encrypted => fingerprint_suffix(fingerprint, "[encrypted]"),
+        VariableSensitivity::Sensitive => fingerprint_suffix(fingerprint, "[sensitive]"),
+        VariableSensitivity::Sealed => fingerprint_suffix(fingerprint, "[sealed]"),
+    }
+}
+
+fn fingerprint_suffix(fingerprint: Option<&str>, label: &str) -> String {
+    let Some(fingerprint) = fingerprint else {
+        return label.to_string();
+    };
+    let suffix = fingerprint
+        .get(fingerprint.len().saturating_sub(8)..)
+        .unwrap_or(fingerprint);
+    format!("{label} ...{suffix}")
+}
+
+fn redaction_values(value: &str) -> Vec<String> {
+    if value.len() < 4 || matches!(value, "true" | "false" | "TRUE" | "FALSE") {
+        return Vec::new();
+    }
+    let mut values = BTreeSet::new();
+    values.insert(value.to_string());
+    values.insert(hex::encode(value.as_bytes()));
+    values.insert(value.replace('\n', "\\n"));
+    values.insert(value.replace('\n', ""));
+    values.into_iter().collect()
+}
+
+pub(crate) fn blob_id(hash: &ContentHash) -> String {
     format!("{}:{}", hash.algorithm, hash.digest)
 }
 
-fn ref_id(repository_id: &RepositoryId, name: &str) -> String {
+pub(crate) fn ref_id(repository_id: &RepositoryId, name: &str) -> String {
     format!("{}_{}", repository_id.as_str(), name)
+}
+
+/// Durable resource id for an OCI manifest.
+///
+/// Manifests are addressed per repository, so the same digest legitimately
+/// exists in several repositories at once. The id has to carry the repository
+/// as well, otherwise a push to the second repository overwrites the first
+/// record and hydration silently drops one repository's copy of the manifest,
+/// which then serves MANIFEST_UNKNOWN forever. `@` cannot appear in a
+/// repository name accepted by `validate_oci_repository_name`, so the pair is
+/// unambiguous.
+pub(crate) fn oci_manifest_id(repository: &str, digest: &str) -> String {
+    format!("{repository}@{digest}")
 }
 
 fn idempotency_key(headers: &HeaderMap) -> Option<String> {
@@ -7774,6 +10008,54 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    #[test]
+    fn corrupt_persistence_file_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("nebula-corrupt-{}", now_unix_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        fs::write(&path, "{ not valid json").unwrap();
+        match load_registry_from_persistence(Some(&path)) {
+            Ok(_) => panic!("expected corrupt persistence load to fail"),
+            Err(error) => assert!(
+                error.contains("failed to load registry persistence"),
+                "{error}"
+            ),
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn atomic_save_round_trips_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!("nebula-atomic-{}", now_unix_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        let mut registry = InMemoryRegistry::default();
+        registry.repositories.insert(
+            RepositoryId::new("repo_atomic"),
+            RepositoryRecord {
+                id: RepositoryId::new("repo_atomic"),
+                name: "acme/app".to_string(),
+                org_id: None,
+            },
+        );
+        registry.save_to_path(&path).unwrap();
+        assert!(path.exists());
+        let reloaded = InMemoryRegistry::load_from_path(&path).unwrap();
+        assert!(reloaded.repositories.contains_key(&RepositoryId::new("repo_atomic")));
+        let tmp_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".nebula-registry-tmp-")
+            })
+            .count();
+        assert_eq!(tmp_count, 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     struct AllowAllAuthProvider;
 
     #[async_trait::async_trait]
@@ -7808,6 +10090,18 @@ mod tests {
                     PolicyAction::ReviewProposal,
                     PolicyAction::RunStatusCheck,
                     PolicyAction::IndexCode,
+                    PolicyAction::ManageVariables,
+                    PolicyAction::ReadVariableMetadata,
+                    PolicyAction::ReadEncryptedVariable,
+                    PolicyAction::ReadVariableValue,
+                    PolicyAction::InjectVariable,
+                    PolicyAction::RevealVariable,
+                    PolicyAction::SaveSecret,
+                    PolicyAction::PushSecret,
+                    PolicyAction::ExportSecret,
+                    PolicyAction::UseWorkspaceForDeploy,
+                    PolicyAction::MutateDeployVariables,
+                    PolicyAction::ManageVariablePolicy,
                 ],
             })
         }
@@ -7901,6 +10195,138 @@ mod tests {
         let schema: Value = serde_json::from_slice(&body).unwrap();
         assert!(schema.get("CreateRepositoryRequest").is_some());
         assert!(schema.get("ProjectionManifest").is_some());
+    }
+
+    #[tokio::test]
+    async fn registry_masks_sensitive_variables_and_injects_authorized_bundle() {
+        let app = router(RegistryConfig {
+            secret_encryption_key: Some("test-secret-encryption-key-at-least-32-bytes".to_string()),
+            ..Default::default()
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/galaxies")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"acme/env-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let repo: RepositoryRecord = serde_json::from_slice(&body).unwrap();
+        let env = Environment {
+            id: EnvironmentId::new("env_production"),
+            repository_id: repo.id.clone(),
+            name: "production".to_string(),
+            kind: EnvironmentKind::Production,
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/galaxies/{}/environments", repo.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&env).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/v1/galaxies/{}/environments/{}/variables",
+                        repo.id, env.id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "key":"DATABASE_URL",
+                            "value":"postgres://user:pass@example/db",
+                            "availability":["Build","Runtime"],
+                            "sensitivity":"Sensitive"
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/galaxies/{}/environments/{}/variables",
+                        repo.id, env.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let listed: ListEnvironmentVariablesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed.variables.len(), 1);
+        assert!(
+            listed.variables[0]
+                .current_version
+                .as_ref()
+                .unwrap()
+                .plaintext_value
+                .is_none()
+        );
+        assert!(
+            listed.variables[0]
+                .current_version
+                .as_ref()
+                .unwrap()
+                .masked_value
+                .as_deref()
+                .unwrap()
+                .contains("[sensitive]")
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/v1/galaxies/{}/environments/{}/variables/inject",
+                        repo.id, env.id
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "actor":{"Integration":"horizon"},
+                            "service_id":"workspace/project/production/client",
+                            "availability":"Build"
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let injected: InjectEnvironmentVariablesResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(injected.variables[0].key, "DATABASE_URL");
+        assert_eq!(
+            injected.variables[0].value,
+            "postgres://user:pass@example/db"
+        );
+        assert!(injected.redaction_tokens.contains_key("DATABASE_URL"));
     }
 
     #[tokio::test]
@@ -8280,6 +10706,89 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
     }
 
+    #[tokio::test]
+    async fn astracollab_bootstrap_token_reads_and_writes_but_cannot_manage_auth() {
+        let repository_id = RepositoryId::new("repo_astracollab");
+        let mut registry = InMemoryRegistry::default();
+        registry.repositories.insert(
+            repository_id.clone(),
+            RepositoryRecord {
+                id: repository_id.clone(),
+                name: "acme/astracollab".to_string(),
+                org_id: None,
+            },
+        );
+        let service_policy = default_astracollab_service_policy(&repository_id);
+        registry
+            .policies
+            .insert(service_policy.id.clone(), service_policy);
+        let raw_token = "astracollab-service-test-token";
+        let app = router_with_state(
+            RegistryConfig {
+                auth_required: true,
+                bootstrap_auth_tokens: vec![RegistryBootstrapAuthToken {
+                    name: "astracollab-dashboard".to_string(),
+                    raw_token: raw_token.to_string(),
+                    scopes: vec![PolicyAction::ReadBlob, PolicyAction::WriteChangeSet],
+                }],
+                ..Default::default()
+            },
+            registry,
+        );
+
+        // WriteChangeSet-scoped route (blob PUT) succeeds.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/galaxies/{repository_id}/blobs"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {raw_token}"))
+                    .body(Body::from(
+                        r#"{"bytes_utf8":"hello","media_type":"text/plain","visibility":"Public"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let created: BlobPutResponse = serde_json::from_slice(&body).unwrap();
+
+        // ReadBlob-scoped route (blob GET) succeeds.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/galaxies/{}/blobs/{}/{}",
+                        repository_id, created.blob.hash.algorithm, created.blob.hash.digest
+                    ))
+                    .header("authorization", format!("Bearer {raw_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // ManageAuth-scoped route (creating a new galaxy) is rejected.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/galaxies")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {raw_token}"))
+                    .body(Body::from(r#"{"name":"acme/other"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
     #[test]
     fn stored_api_token_is_hash_checked_and_repository_bound() {
         let repository_id = RepositoryId::new("repo_a");
@@ -8328,6 +10837,7 @@ mod tests {
             telemetry_event_file: None,
             telemetry_webhook_url: None,
             telemetry_webhook_secret: None,
+            secret_encryption_key: Some("test-secret-encryption-key-at-least-32-bytes".to_string()),
             http_client: reqwest::Client::new(),
         };
 
@@ -8367,6 +10877,198 @@ mod tests {
     fn oci_test_digest(bytes: &[u8]) -> String {
         let hash = ContentHash::sha256(bytes);
         format!("{}:{}", hash.algorithm, hash.digest)
+    }
+
+    /// Minimal store that only supports the resource put/list calls hydration
+    /// needs, so tests can exercise a real write -> restart -> read round trip.
+    #[derive(Default)]
+    struct FakeResourceStore {
+        resources: std::sync::Mutex<BTreeMap<(String, String), Value>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RegistryStore for FakeResourceStore {
+        async fn put_resource(
+            &self,
+            _repository_id: Option<&RepositoryId>,
+            kind: &str,
+            id: &str,
+            value: Value,
+        ) -> NebulaResult<()> {
+            self.resources
+                .lock()
+                .unwrap()
+                .insert((kind.to_string(), id.to_string()), value);
+            Ok(())
+        }
+
+        async fn list_resources(&self, kind: &str) -> NebulaResult<Vec<Value>> {
+            Ok(self
+                .resources
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((stored_kind, _), _)| stored_kind == kind)
+                .map(|(_, value)| value.clone())
+                .collect())
+        }
+
+        async fn put_repository_record(
+            &self,
+            _repository_id: &RepositoryId,
+            _value: Value,
+        ) -> NebulaResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn get_repository_record(
+            &self,
+            _repository_id: &RepositoryId,
+        ) -> NebulaResult<Value> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn get_resource(&self, _kind: &str, _id: &str) -> NebulaResult<Value> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn get_resource_scoped(
+            &self,
+            _repository_id: Option<&RepositoryId>,
+            _kind: &str,
+            _id: &str,
+        ) -> NebulaResult<Value> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn list_resources_scoped(
+            &self,
+            _repository_id: Option<&RepositoryId>,
+            _kind: &str,
+        ) -> NebulaResult<Vec<Value>> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn delete_resource(
+            &self,
+            _repository_id: Option<&RepositoryId>,
+            _kind: &str,
+            _id: &str,
+        ) -> NebulaResult<()> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn put_resource_idempotent(
+            &self,
+            _repository_id: Option<&RepositoryId>,
+            _kind: &str,
+            _id: &str,
+            _idempotency_key: &str,
+            _value: Value,
+        ) -> NebulaResult<Value> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn compare_and_swap_ref(
+            &self,
+            _repository_id: &RepositoryId,
+            _name: &str,
+            _expected_target: Option<Value>,
+            _next_ref: Value,
+        ) -> NebulaResult<bool> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        async fn commit_transaction(
+            &self,
+            _transaction: RegistryTransaction,
+        ) -> NebulaResult<RegistryTransactionResult> {
+            unimplemented!("not exercised by these tests")
+        }
+    }
+
+    fn oci_test_manifest(repository: &str, digest: &str) -> OciManifest {
+        OciManifest {
+            schema_version: OCI_METADATA_SCHEMA_VERSION,
+            repository_name: repository.to_string(),
+            repository_name_normalized: repository.to_string(),
+            reference: Some("latest".to_string()),
+            digest: digest.to_string(),
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            size_bytes: 0,
+            bytes: Vec::new(),
+            referenced_digests: Vec::new(),
+            created_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_digest_survives_hydration_in_every_repository() {
+        let store = FakeResourceStore::default();
+        let digest = oci_test_digest(b"shared manifest");
+
+        // The same image content pushed under two names: with digest-only ids
+        // the second push overwrote the first and one repository lost its
+        // manifest on the next restart.
+        for repository in ["nebula/nebula-registry-server", "acme/app"] {
+            let manifest = oci_test_manifest(repository, &digest);
+            store
+                .put_resource(
+                    None,
+                    "oci_manifest",
+                    &oci_manifest_id(repository, &digest),
+                    serde_json::to_value(&manifest).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut registry = InMemoryRegistry::default();
+        hydrate_registry_from_store(&store, &mut registry)
+            .await
+            .unwrap();
+
+        for repository in ["nebula/nebula-registry-server", "acme/app"] {
+            assert!(
+                registry
+                    .oci_manifests
+                    .contains_key(&(repository.to_string(), digest.clone())),
+                "{repository} lost its manifest across hydration"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_digest_keyed_manifests_still_hydrate() {
+        let store = FakeResourceStore::default();
+        let digest = oci_test_digest(b"legacy manifest");
+        let repository = "nebula/nebula-registry-server";
+        let manifest = oci_test_manifest(repository, &digest);
+
+        // Records written before ids were scoped per repository are stored
+        // under the bare digest; they carry the repository in the payload, so
+        // they must still land in the right slot without a migration.
+        store
+            .put_resource(
+                None,
+                "oci_manifest",
+                &digest,
+                serde_json::to_value(&manifest).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut registry = InMemoryRegistry::default();
+        hydrate_registry_from_store(&store, &mut registry)
+            .await
+            .unwrap();
+
+        assert!(
+            registry
+                .oci_manifests
+                .contains_key(&(repository.to_string(), digest))
+        );
     }
 
     #[test]

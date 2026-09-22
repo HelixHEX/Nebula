@@ -1,0 +1,74 @@
+# Fly.io config for Nebula Registry Server (hive-registry)
+# Location: astracollab/nebula/fly.toml
+# Deploy with: fly deploy --config astracollab/nebula/fly.toml
+#           or: cd astracollab/nebula && fly deploy
+#
+# Required secrets - set BEFORE first deploy:
+#   fly secrets set DATABASE_URL="postgres://..." \
+#     BLOB_STORE_URL="s3://your-bucket/nebula-registry" \
+#     NEBULA_AUTH_SECRET="$(openssl rand -base64 32)" \
+#     NEBULA_AUTH_BASE_URL="https://<app>.fly.dev" \
+#     AWS_ACCESS_KEY_ID="..." \
+#     AWS_SECRET_ACCESS_KEY="..."
+# Optional S3 vars if not AWS: AWS_ENDPOINT_URL, AWS_REGION, AWS_ALLOW_HTTP
+#
+# See docs/production-registry.md for full env matrix.
+
+app = "hive-registry"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile.registry-server"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  NEBULA_REGISTRY_BACKEND = "postgres-object-store"
+  NEBULA_RUN_MIGRATIONS = "true"
+  NEBULA_AUTH_REQUIRED = "true"
+  NEBULA_AUTH_PROVIDER = "better-auth-rs"
+  NEBULA_ADMIN_API_ENABLED = "true"
+  NEBULA_ADMIN_REQUIRE_BETTER_AUTH = "true"
+  # Set your admin allowlist via secrets or env:
+  # NEBULA_ADMIN_BOOTSTRAP_EMAILS = "ops@example.com"
+  # NEBULA_ADMIN_BOOTSTRAP_ROLE = "owner"
+  NEBULA_TELEMETRY_SINKS = "json,prometheus"
+  NEBULA_REQUEST_TIMEOUT_SECONDS = "30"
+  NEBULA_REQUEST_BODY_LIMIT_BYTES = "16777216"
+  NEBULA_RATE_LIMIT_REQUESTS_PER_SECOND = "512"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 1000
+    soft_limit = 500
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/health/live"
+    timeout = "3s"
+    type = "http"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "2gb"
+
+# Uncomment to run a second readiness check (not required for Fly's proxy,
+# but useful for monitoring):
+# [[services.http_checks]]
+#   grace_period = "15s"
+#   interval = "30s"
+#   method = "GET"
+#   path = "/health/ready"
+#   protocol = "http"
+#   timeout = "5s"

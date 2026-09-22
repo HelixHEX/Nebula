@@ -69,7 +69,17 @@ async fn app(config: ServerConfig) -> Result<Router> {
         blob_store_url: config.registry.blob_store_url.clone(),
         vector_store_url: config.registry.vector_store_url.clone(),
     };
-    let better_auth = if matches!(config.auth_provider, AuthProviderMode::BetterAuthRs) {
+    // Built whenever better-auth-rs is configured (auth_secret + auth_base_url
+    // present), not only when it's the *selected* `auth_provider` — this lets
+    // a registry verify both its own better-auth-rs-issued service/API-key
+    // tokens AND an externally-configured JWKS issuer's tokens at the same
+    // time (see auth_middleware's fallback chain in nebula-registry). Only
+    // the self-serve `/auth/*` routes stay gated strictly to
+    // `AuthProviderMode::BetterAuthRs`, since exposing registration/login
+    // isn't something a JWKS-primary deployment necessarily wants.
+    let better_auth = if matches!(config.auth_provider, AuthProviderMode::BetterAuthRs)
+        || (config.auth_secret.is_some() && config.auth_base_url.is_some())
+    {
         Some(better_auth_bridge::build(&config).await?)
     } else {
         None
@@ -340,6 +350,8 @@ mod tests {
                 telemetry_event_file: None,
                 telemetry_webhook_url: None,
                 telemetry_webhook_secret: None,
+                secret_encryption_key: None,
+                bootstrap_auth_tokens: Vec::new(),
                 persistence_path: None,
             },
         };

@@ -1,0 +1,19 @@
+ARG RUST_VERSION=1.89
+
+FROM rust:${RUST_VERSION}-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release -p nebula-cli \
+    && cp target/release/neb /usr/local/bin/neb
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --create-home --uid 10001 nebula
+COPY --from=builder /usr/local/bin/neb /usr/local/bin/neb
+USER nebula
+ENTRYPOINT ["neb"]

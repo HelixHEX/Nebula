@@ -28,6 +28,7 @@ indicatif = "0.18.4"
 nebula-core = { path = "../nebula-core" }
 nebula-git = { path = "../nebula-git" }
 nebula-local = { path = "../nebula-local" }
+nebula-registry = { path = "../nebula-registry" }
 nebula-storage = { path = "../nebula-storage" }
 nebula-sync = { path = "../nebula-sync" }
 nebula-vector = { path = "../nebula-vector" }

@@ -36,20 +36,42 @@ nebula/
 
 ## Build From Source
 
+There are no published binary installers yet (see `docs/support-matrix.md`) —
+`cargo-dist` is configured, but no public release tag has been validated. The
+only supported install path today is building from source.
+
 Requirements:
 
 - Rust 1.89 or newer
 - Postgres and object storage only for registry production-path validation
 - k6 only for load tests
 
+Clone the repo, then install the `neb` binary onto your `PATH` via Cargo:
+
+```bash
+git clone <this repository>
+cd nebula
+cargo install --path crates/nebula-cli
+```
+
+This places `neb` in `$CARGO_HOME/bin` (usually `~/.cargo/bin`), matching the
+`install-path` that `cargo-dist` will use for future published installers.
+Make sure that directory is on your shell's `PATH` (the standard Rust
+installer via https://rustup.rs adds it automatically).
+
+Verify it worked:
+
+```bash
+neb --help
+```
+
+If you're actively developing Nebula itself rather than just using the CLI,
+build and run in place instead so you don't need to reinstall on every
+change:
+
 ```bash
 cargo build --workspace
 cargo run -p nebula-cli -- init
-```
-
-The CLI binary is named `neb`:
-
-```bash
 cargo run -p nebula-cli -- status
 cargo run -p nebula-cli -- save --message "Initial Nebula snapshot"
 ```

@@ -141,11 +141,16 @@ impl ServerConfig {
         let postgres_url = env::var("DATABASE_URL").ok();
         let blob_store_url = env::var("BLOB_STORE_URL").ok();
         let vector_store_url = env::var("VECTOR_STORE_URL").ok();
-        let astracollab_deploy_url = env::var("ASTRACOLLAB_DEPLOY_URL").ok();
         let astracollab_deploy_signing_secret = env::var("ASTRACOLLAB_DEPLOY_SIGNING_SECRET").ok();
         let registry_public_url = env::var("NEBULA_REGISTRY_PUBLIC_URL")
             .ok()
             .or_else(|| auth_base_url.clone());
+        let astracollab_deploy_url = normalize_deploy_url(
+            env::var("ASTRACOLLAB_DEPLOY_URL").ok(),
+            env::var("ASTRACOLLAB_DEPLOY_BASE_URL")
+                .ok()
+                .or_else(|| env::var("WEBHOOK_BASE_URL").ok()),
+        );
         let telemetry_sinks = env::var("NEBULA_TELEMETRY_SINKS")
             .unwrap_or_else(|_| "json,prometheus".to_string())
             .split(',')
@@ -255,6 +260,7 @@ impl ServerConfig {
                 telemetry_event_file,
                 telemetry_webhook_url,
                 telemetry_webhook_secret,
+                secret_encryption_key: env::var("NEBULA_SECRET_ENCRYPTION_KEY").ok(),
                 bootstrap_auth_tokens: bootstrap_auth_tokens_from_env(),
                 persistence_path: env::var("NEBULA_REGISTRY_PERSISTENCE_PATH")
                     .ok()
@@ -268,6 +274,27 @@ impl ServerConfig {
             .parse()
             .context("HOST/PORT must form a valid socket address")
     }
+}
+
+fn normalize_deploy_url(url: Option<String>, base_url: Option<String>) -> Option<String> {
+    let url = url?;
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed.to_string());
+    }
+    if !trimmed.starts_with('/') {
+        return Some(trimmed.to_string());
+    }
+
+    let base = base_url
+        .filter(|base| !base.trim().is_empty())
+        .unwrap_or_else(|| {
+            "http://lucity-conductor.lucity-system.svc.cluster.local:9004".to_string()
+        });
+    Some(format!("{}{}", base.trim_end_matches('/'), trimmed))
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
@@ -292,23 +319,32 @@ fn env_list(name: &str) -> Vec<String> {
 
 fn bootstrap_auth_tokens_from_env() -> Vec<RegistryBootstrapAuthToken> {
     let mut tokens = Vec::new();
-    if let Ok(raw_token) = env::var("NEBULA_REGISTRY_BUILDER_TOKEN") {
-        if !raw_token.trim().is_empty() {
-            tokens.push(RegistryBootstrapAuthToken {
-                name: "horizon-builder".to_string(),
-                raw_token,
-                scopes: vec![PolicyAction::PushImage, PolicyAction::PullImage],
-            });
-        }
+    if let Ok(raw_token) = env::var("NEBULA_REGISTRY_BUILDER_TOKEN")
+        && !raw_token.trim().is_empty()
+    {
+        tokens.push(RegistryBootstrapAuthToken {
+            name: "horizon-builder".to_string(),
+            raw_token,
+            scopes: vec![PolicyAction::PushImage, PolicyAction::PullImage],
+        });
     }
-    if let Ok(raw_token) = env::var("NEBULA_REGISTRY_READER_TOKEN") {
-        if !raw_token.trim().is_empty() {
-            tokens.push(RegistryBootstrapAuthToken {
-                name: "horizon-reader".to_string(),
-                raw_token,
-                scopes: vec![PolicyAction::PullImage],
-            });
-        }
+    if let Ok(raw_token) = env::var("NEBULA_REGISTRY_READER_TOKEN")
+        && !raw_token.trim().is_empty()
+    {
+        tokens.push(RegistryBootstrapAuthToken {
+            name: "horizon-reader".to_string(),
+            raw_token,
+            scopes: vec![PolicyAction::PullImage],
+        });
+    }
+    if let Ok(raw_token) = env::var("NEBULA_REGISTRY_ASTRACOLLAB_SERVICE_TOKEN")
+        && !raw_token.trim().is_empty()
+    {
+        tokens.push(RegistryBootstrapAuthToken {
+            name: "astracollab-dashboard".to_string(),
+            raw_token,
+            scopes: vec![PolicyAction::ReadBlob, PolicyAction::WriteChangeSet],
+        });
     }
     tokens
 }

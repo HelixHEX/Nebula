@@ -45,7 +45,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "request-id", "timeout", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-object_store = { version = "0.12", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 url = "2"
 jsonwebtoken = "9"

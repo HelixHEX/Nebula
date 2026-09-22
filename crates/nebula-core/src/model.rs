@@ -505,6 +505,175 @@ pub struct Environment {
     pub kind: EnvironmentKind,
 }
 
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum VariableScope {
+    Shared,
+    Service { service_id: String },
+    Branch { branch: String },
+    Workspace { workspace_id: WorkspaceId },
+}
+
+impl VariableScope {
+    pub fn stable_key(&self) -> String {
+        match self {
+            VariableScope::Shared => "shared".to_string(),
+            VariableScope::Service { service_id } => format!("service:{service_id}"),
+            VariableScope::Branch { branch } => format!("branch:{branch}"),
+            VariableScope::Workspace { workspace_id } => format!("workspace:{workspace_id}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum VariableAvailability {
+    Build,
+    Runtime,
+    Functions,
+    Jobs,
+    Local,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum VariableSensitivity {
+    Public,
+    Encrypted,
+    Sensitive,
+    Sealed,
+}
+
+impl VariableSensitivity {
+    pub fn is_write_only(&self) -> bool {
+        matches!(self, Self::Sensitive | Self::Sealed)
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum VariableValueKind {
+    Literal,
+    Secret,
+    Reference,
+    ProviderRef,
+    System,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum VariableSecretStorageMode {
+    MetadataOnly,
+    RegistryEncrypted,
+    BlobBackedEncrypted,
+    ExternalProvider,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct VariableReference {
+    pub namespace: String,
+    pub key: String,
+    #[serde(default)]
+    pub service_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentVariable {
+    pub id: EnvironmentVariableId,
+    pub repository_id: RepositoryId,
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
+    pub environment_id: EnvironmentId,
+    pub scope: VariableScope,
+    pub key: String,
+    pub value_kind: VariableValueKind,
+    #[serde(default)]
+    pub availability: Vec<VariableAvailability>,
+    pub sensitivity: VariableSensitivity,
+    pub storage_mode: VariableSecretStorageMode,
+    #[serde(default)]
+    pub current_version_id: Option<EnvironmentVariableVersionId>,
+    #[serde(default)]
+    pub reference: Option<VariableReference>,
+    #[serde(default)]
+    pub created_by: Option<Actor>,
+    #[serde(default)]
+    pub updated_by: Option<Actor>,
+    pub created_at_unix_ms: u64,
+    pub updated_at_unix_ms: u64,
+}
+
+impl EnvironmentVariable {
+    pub fn stable_id(
+        repository_id: &RepositoryId,
+        environment_id: &EnvironmentId,
+        scope: &VariableScope,
+        key: &str,
+    ) -> EnvironmentVariableId {
+        let normalized_key = key.trim().to_ascii_uppercase();
+        EnvironmentVariableId::new(format!(
+            "envvar_{}_{}_{}_{}",
+            repository_id.as_str(),
+            environment_id.as_str(),
+            scope.stable_key().replace([':', '/', '\\'], "_"),
+            normalized_key
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentVariableVersion {
+    pub id: EnvironmentVariableVersionId,
+    pub repository_id: RepositoryId,
+    pub variable_id: EnvironmentVariableId,
+    pub key: String,
+    pub sensitivity: VariableSensitivity,
+    pub value_kind: VariableValueKind,
+    pub storage_mode: VariableSecretStorageMode,
+    #[serde(default)]
+    pub plaintext_value: Option<String>,
+    #[serde(default)]
+    pub ciphertext: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<ContentHash>,
+    #[serde(default)]
+    pub encryption_key_id: Option<String>,
+    #[serde(default)]
+    pub wrapped_data_key: Option<String>,
+    #[serde(default)]
+    pub nonce: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub value_digest: Option<String>,
+    #[serde(default)]
+    pub redaction_tokens: Vec<String>,
+    #[serde(default)]
+    pub created_by: Option<Actor>,
+    pub created_at_unix_ms: u64,
+    #[serde(default)]
+    pub last_injected_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub last_used_by_deploy_id: Option<DeployIntentId>,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum VariableChangeState {
+    Staged,
+    Applied,
+    Denied,
+    Superseded,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentVariableChange {
+    pub id: String,
+    pub repository_id: RepositoryId,
+    pub variable_id: EnvironmentVariableId,
+    pub actor: Actor,
+    pub action: String,
+    pub state: VariableChangeState,
+    pub before_version_id: Option<EnvironmentVariableVersionId>,
+    pub after_version_id: Option<EnvironmentVariableVersionId>,
+    pub reason: Option<String>,
+    pub created_at_unix_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub enum Actor {
     User(String),
@@ -751,8 +920,13 @@ pub struct DeployArtifactRef {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct DeployTriggerSource {
     pub kind: String,
+    #[serde(default)]
     pub installation_id: Option<String>,
+    #[serde(default)]
     pub event_id: Option<String>,
+    /// Ref name that triggered the deploy (e.g. `main` for push auto-deploy).
+    #[serde(default, rename = "ref")]
+    pub reference: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -763,6 +937,55 @@ pub struct DeployTarget {
     pub context_path: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub enum VariableMutationMode {
+    Deny,
+    Stage,
+    Apply,
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+pub struct DeploymentEnvironmentPolicy {
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default)]
+    pub workspace_selector: Option<String>,
+    #[serde(default)]
+    pub environment_id: Option<EnvironmentId>,
+    #[serde(default)]
+    pub environment_name: Option<String>,
+    #[serde(default)]
+    pub service_ids: Vec<String>,
+    #[serde(default)]
+    pub allow_build_variables: bool,
+    #[serde(default)]
+    pub allow_runtime_variables: bool,
+    #[serde(default)]
+    pub allow_encrypted_snapshot_variables: bool,
+    #[serde(default)]
+    pub mutation_mode: Option<VariableMutationMode>,
+}
+
+impl Default for DeploymentEnvironmentPolicy {
+    fn default() -> Self {
+        Self {
+            workspace_id: None,
+            workspace_selector: None,
+            environment_id: None,
+            environment_name: None,
+            service_ids: Vec::new(),
+            allow_build_variables: false,
+            allow_runtime_variables: false,
+            allow_encrypted_snapshot_variables: true,
+            mutation_mode: Some(VariableMutationMode::Deny),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct RepositoryDeployConfig {
     pub repository_id: RepositoryId,
@@ -771,9 +994,17 @@ pub struct RepositoryDeployConfig {
     pub signing_secret: String,
     pub service_id: String,
     #[serde(default)]
+    pub environment_id: Option<EnvironmentId>,
+    #[serde(default)]
     pub environment_name: Option<String>,
     #[serde(default)]
     pub context_path: Option<String>,
+    #[serde(default)]
+    pub env_policy: Option<DeploymentEnvironmentPolicy>,
+    /// When true, updating the galaxy default ref creates a deploy intent for
+    /// this service. Defaults to true so existing configs auto-deploy after upgrade.
+    #[serde(default = "default_true")]
+    pub auto_deploy: bool,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
@@ -782,9 +1013,15 @@ pub struct RepositoryDeployConfigView {
     pub deploy_url: String,
     pub service_id: String,
     #[serde(default)]
+    pub environment_id: Option<EnvironmentId>,
+    #[serde(default)]
     pub environment_name: Option<String>,
     #[serde(default)]
     pub context_path: Option<String>,
+    #[serde(default)]
+    pub env_policy: Option<DeploymentEnvironmentPolicy>,
+    #[serde(default = "default_true")]
+    pub auto_deploy: bool,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
@@ -794,9 +1031,15 @@ pub struct SetRepositoryDeployConfigRequest {
     pub signing_secret: String,
     pub service_id: String,
     #[serde(default)]
+    pub environment_id: Option<EnvironmentId>,
+    #[serde(default)]
     pub environment_name: Option<String>,
     #[serde(default)]
     pub context_path: Option<String>,
+    #[serde(default)]
+    pub env_policy: Option<DeploymentEnvironmentPolicy>,
+    #[serde(default = "default_true")]
+    pub auto_deploy: bool,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -806,6 +1049,8 @@ pub struct DeployPolicyEvidence {
     pub blocked_count: u32,
     pub embargo_count: u32,
     pub manifest_digest: String,
+    #[serde(default)]
+    pub env_policy: Option<DeploymentEnvironmentPolicy>,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -843,6 +1088,8 @@ pub struct DeployIntent {
     pub requested_provider_key: String,
     pub requested_by: Actor,
     pub target: Option<DeployTarget>,
+    #[serde(default)]
+    pub env_policy: Option<DeploymentEnvironmentPolicy>,
     pub policy_evidence: Option<DeployPolicyEvidence>,
     pub release_gate_evidence: Option<DeployReleaseGateEvidence>,
     pub trigger_source: Option<DeployTriggerSource>,
@@ -974,11 +1221,24 @@ pub enum PolicyAction {
     CreateProjection,
     Deploy,
     ManageAuth,
+    ManageDeployConfig,
     ManageWebhooks,
     SyncObjects,
     ReviewProposal,
     RunStatusCheck,
     IndexCode,
+    ManageVariables,
+    ReadVariableMetadata,
+    ReadEncryptedVariable,
+    ReadVariableValue,
+    InjectVariable,
+    RevealVariable,
+    SaveSecret,
+    PushSecret,
+    ExportSecret,
+    UseWorkspaceForDeploy,
+    MutateDeployVariables,
+    ManageVariablePolicy,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -988,6 +1248,9 @@ pub enum PolicyObject {
     ChangeSet(ChangeSetId),
     Proposal(ProposalId),
     Projection(ProjectionId),
+    EnvironmentVariable(EnvironmentVariableId),
+    Deployment(DeployIntentId),
+    Workspace(WorkspaceId),
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1055,12 +1318,14 @@ pub fn canonicalize_entries(
         .iter()
         .filter(|entry| !matches!(entry.kind, TreeEntryKind::Directory))
         .map(|entry| entry.path.as_str())
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
     for entry in &normalized {
-        for file_path in &file_paths {
-            if entry.path.starts_with(&format!("{file_path}/")) {
+        let mut ancestor = entry.path.as_str();
+        while let Some((head, _)) = ancestor.rsplit_once('/') {
+            if file_paths.contains(head) {
                 return Err(ModelValidationError::FilePathConflict(entry.path.clone()));
             }
+            ancestor = head;
         }
     }
     Ok(normalized)

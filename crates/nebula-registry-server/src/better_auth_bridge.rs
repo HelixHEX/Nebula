@@ -8,7 +8,7 @@ use better_auth::{
         AdminPlugin, ApiKeyPlugin, EmailPasswordPlugin, OrganizationPlugin, SessionManagementPlugin,
     },
 };
-use nebula_core::{Actor, PolicyAction, RepositoryId};
+use nebula_core::{Actor, AuthTokenId, PolicyAction, RepositoryId};
 use nebula_registry::{RegistryAuthProvider, VerifiedClaims};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -196,11 +196,12 @@ impl BetterAuthVerifier {
         let key = self.verify_api_key_view(raw_token).await?;
         let org_id = key.org_id();
         let repository_id = key.repository_id().or(route_repository_id);
+        let token_id = key.id.clone().map(AuthTokenId::new);
         Ok(VerifiedClaims {
             actor: Actor::User(key.user_id),
             org_id,
             repository_id,
-            token_id: None,
+            token_id,
             scopes: policy_actions_from_permissions(key.permissions.as_ref()),
         })
     }
@@ -271,6 +272,8 @@ struct VerifyApiKeyResponse {
 
 #[derive(Deserialize)]
 struct ApiKeyView {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(rename = "userId")]
     user_id: String,
     permissions: Option<Value>,
@@ -337,6 +340,9 @@ fn policy_action_from_str(action: &str) -> Option<PolicyAction> {
         }
         "deploy" | "nebula.repository:deploy" => Some(PolicyAction::Deploy),
         "manage_auth" | "nebula.repository:manage_auth" => Some(PolicyAction::ManageAuth),
+        "manage_deploy_config" | "nebula.repository:manage_deploy_config" => {
+            Some(PolicyAction::ManageDeployConfig)
+        }
         "manage_webhooks" | "nebula.repository:manage_webhooks" => {
             Some(PolicyAction::ManageWebhooks)
         }
@@ -348,6 +354,36 @@ fn policy_action_from_str(action: &str) -> Option<PolicyAction> {
             Some(PolicyAction::RunStatusCheck)
         }
         "index_code" | "nebula.repository:index_code" => Some(PolicyAction::IndexCode),
+        "manage_variables" | "nebula.repository:manage_variables" => {
+            Some(PolicyAction::ManageVariables)
+        }
+        "read_variable_metadata" | "nebula.repository:read_variable_metadata" => {
+            Some(PolicyAction::ReadVariableMetadata)
+        }
+        "read_encrypted_variable" | "nebula.repository:read_encrypted_variable" => {
+            Some(PolicyAction::ReadEncryptedVariable)
+        }
+        "read_variable_value" | "nebula.repository:read_variable_value" => {
+            Some(PolicyAction::ReadVariableValue)
+        }
+        "inject_variable" | "nebula.repository:inject_variable" => {
+            Some(PolicyAction::InjectVariable)
+        }
+        "reveal_variable" | "nebula.repository:reveal_variable" => {
+            Some(PolicyAction::RevealVariable)
+        }
+        "save_secret" | "nebula.repository:save_secret" => Some(PolicyAction::SaveSecret),
+        "push_secret" | "nebula.repository:push_secret" => Some(PolicyAction::PushSecret),
+        "export_secret" | "nebula.repository:export_secret" => Some(PolicyAction::ExportSecret),
+        "use_workspace_for_deploy" | "nebula.repository:use_workspace_for_deploy" => {
+            Some(PolicyAction::UseWorkspaceForDeploy)
+        }
+        "mutate_deploy_variables" | "nebula.repository:mutate_deploy_variables" => {
+            Some(PolicyAction::MutateDeployVariables)
+        }
+        "manage_variable_policy" | "nebula.repository:manage_variable_policy" => {
+            Some(PolicyAction::ManageVariablePolicy)
+        }
         _ => None,
     }
 }
@@ -371,6 +407,18 @@ fn all_policy_actions() -> Vec<PolicyAction> {
         PolicyAction::ReviewProposal,
         PolicyAction::RunStatusCheck,
         PolicyAction::IndexCode,
+        PolicyAction::ManageVariables,
+        PolicyAction::ReadVariableMetadata,
+        PolicyAction::ReadEncryptedVariable,
+        PolicyAction::ReadVariableValue,
+        PolicyAction::InjectVariable,
+        PolicyAction::RevealVariable,
+        PolicyAction::SaveSecret,
+        PolicyAction::PushSecret,
+        PolicyAction::ExportSecret,
+        PolicyAction::UseWorkspaceForDeploy,
+        PolicyAction::MutateDeployVariables,
+        PolicyAction::ManageVariablePolicy,
     ]
 }
 
@@ -398,6 +446,7 @@ mod tests {
     #[test]
     fn reads_repository_and_org_binding_from_api_key_metadata() {
         let key = ApiKeyView {
+            id: Some("key_1".to_string()),
             user_id: "user_1".to_string(),
             permissions: None,
             metadata: Some(json!({

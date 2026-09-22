@@ -1,9 +1,30 @@
 ARG RUST_VERSION=1.89
-FROM rust:${RUST_VERSION}-bookworm AS builder
+
+# cargo-chef splits "compile dependencies" from "compile our crates" into
+# separate Docker layers keyed on Cargo.lock, not on source content. Without
+# this, any source edit invalidates the single build layer and forces
+# recompiling the entire dependency tree (~300 crates) from scratch on every
+# build. See "Building The Registry Image" in docs/production-registry.md.
+FROM rust:${RUST_VERSION}-bookworm AS chef
+RUN cargo install cargo-chef --locked
 WORKDIR /app
+
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p nebula-registry-server
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo chef cook --release --recipe-path recipe.json -p nebula-registry-server
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release -p nebula-registry-server \
+    && cp target/release/nebula-registry-server /usr/local/bin/nebula-registry-server
 
 FROM debian:bookworm-slim AS runtime
 LABEL org.opencontainers.image.title="Nebula Registry Server" \
@@ -14,7 +35,7 @@ RUN useradd --create-home --uid 10001 nebula \
   && apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates wget \
   && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/nebula-registry-server /usr/local/bin/nebula-registry-server
+COPY --from=builder /usr/local/bin/nebula-registry-server /usr/local/bin/nebula-registry-server
 USER nebula
 ENV HOST=0.0.0.0
 ENV PORT=8080

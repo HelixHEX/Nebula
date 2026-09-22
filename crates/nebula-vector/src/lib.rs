@@ -518,10 +518,17 @@ pub fn policy_allows_path(context: &RetrievalPolicyContext, path: &str) -> bool 
         .evaluate(&PolicyRequest {
             repository_id: context.repository_id.clone(),
             actor: context.actor.clone(),
+            token_id: None,
             environment: None,
             action: PolicyAction::ReadBlob,
             object: PolicyObject::Path(path.to_string()),
             path: Some(path.to_string()),
+            key: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            deploy_source: None,
         })
         .decision
         == PolicyDecision::Allow

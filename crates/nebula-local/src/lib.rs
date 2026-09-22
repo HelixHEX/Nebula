@@ -1,12 +1,13 @@
 use anyhow::{Context, Result, bail};
 use nebula_core::{
     Actor, BlobId, BlobVisibility, ChangeOperation, ChangeOperationKind, ChangeSet, ChangeSetId,
-    ContentBlob, ContentHash, Environment, EnvironmentId, EnvironmentKind, GitMigrationRecord,
-    IntegrationActor, MAX_IN_MEMORY_BLOB_BYTES, Operation, OperationKind, OperationView,
-    PolicyAction, PolicyDecision, PolicyEngine, PolicyObject, PolicyRequest, PolicyRule, Proposal,
-    ProposalId, Ref, RefId, RefTarget, RepositoryId, ReviewState, SecretFileRef, SecretFileRefId,
-    TreeDiff, TreeDiffKind, TreeEntry, TreeEntryKind, TreeSnapshot, TreeSnapshotId,
-    VisibilityPolicy, WorkspaceId, diff_entries, normalize_repo_path, plan_three_way_merge,
+    ContentBlob, ContentHash, Environment, EnvironmentId, EnvironmentKind, EnvironmentVariable,
+    EnvironmentVariableId, EnvironmentVariableVersion, GitMigrationRecord, IntegrationActor,
+    MAX_IN_MEMORY_BLOB_BYTES, Operation, OperationKind, OperationView, PolicyAction,
+    PolicyDecision, PolicyEngine, PolicyObject, PolicyRequest, PolicyRule, Proposal, ProposalId,
+    Ref, RefId, RefTarget, RepositoryId, ReviewState, SecretFileRef, SecretFileRefId, TreeDiff,
+    TreeDiffKind, TreeEntry, TreeEntryKind, TreeSnapshot, TreeSnapshotId, VisibilityPolicy,
+    WorkspaceId, diff_entries, normalize_repo_path, plan_three_way_merge,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,6 +18,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod ignore_rules;
+
+use ignore_rules::{DEFAULT_PATTERNS, IGNORE_FILE_NAME, IgnoreMatcher};
+
 const NEBULA_DIR: &str = ".nebula";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,6 +30,10 @@ pub struct LocalConfig {
     pub default_ref: String,
     #[serde(default)]
     pub remotes: BTreeMap<String, LocalRemote>,
+    /// Additional gitignore-style patterns, layered on top of Nebula's
+    /// built-in defaults and any root `.nebignore` file.
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,6 +113,12 @@ pub struct LocalSyncBundle {
     pub operations: Vec<Operation>,
     #[serde(default)]
     pub git_migration_records: Vec<GitMigrationRecord>,
+    #[serde(default)]
+    pub environment_variables: Vec<EnvironmentVariable>,
+    #[serde(default)]
+    pub environment_variable_versions: Vec<EnvironmentVariableVersion>,
+    #[serde(default)]
+    pub environments: Vec<Environment>,
     pub blobs: Vec<LocalBlobRecord>,
 }
 
@@ -167,6 +182,7 @@ impl LocalRepo {
                 repository_id,
                 default_ref: "main".to_string(),
                 remotes: BTreeMap::new(),
+                ignore: Vec::new(),
             },
         )?;
         repo.record_operation(
@@ -182,6 +198,10 @@ impl LocalRepo {
         )?;
 
         Ok(repo)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -233,6 +253,7 @@ impl LocalRepo {
                         url: remote_url,
                     },
                 )]),
+                ignore: Vec::new(),
             },
         )?;
         repo.write_active_workspace("main")?;
@@ -658,9 +679,15 @@ impl LocalRepo {
             priority: 100,
             rules: vec![PolicyRule {
                 actor: Actor::Public,
+                token_id: None,
                 environment_id: None,
                 environment_kind: None,
                 path_glob: Some(path_glob),
+                key_glob: None,
+                service_id: None,
+                workspace_id: None,
+                sensitivity: None,
+                availability: None,
                 actions: vec![
                     PolicyAction::ReadPath,
                     PolicyAction::ReadBlob,
@@ -690,10 +717,17 @@ impl LocalRepo {
         Ok(engine.evaluate(&PolicyRequest {
             repository_id: config.repository_id,
             actor: Actor::Public,
+            token_id: None,
             environment: None,
             action,
             object: PolicyObject::Path(path.clone()),
             path: Some(path),
+            key: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            deploy_source: None,
         }))
     }
 
@@ -706,7 +740,7 @@ impl LocalRepo {
             _ => EnvironmentKind::Custom(name.clone()),
         };
         let environment = Environment {
-            id: EnvironmentId::new(format!("env_local_{name}")),
+            id: EnvironmentId::new(format!("env_{name}")),
             repository_id: config.repository_id,
             name,
             kind,
@@ -719,6 +753,41 @@ impl LocalRepo {
         let mut environments = self.read_object_dir("objects/environments")?;
         environments.sort_by(|a: &Environment, b| a.name.cmp(&b.name));
         Ok(environments)
+    }
+
+    pub fn write_environment_variable(&self, variable: &EnvironmentVariable) -> Result<()> {
+        self.write_json(&self.environment_variable_path(&variable.id), variable)
+    }
+
+    pub fn write_environment_variable_version(
+        &self,
+        version: &EnvironmentVariableVersion,
+    ) -> Result<()> {
+        self.write_json(
+            &self.environment_variable_version_path(&version.id),
+            version,
+        )
+    }
+
+    pub fn list_environment_variables(&self) -> Result<Vec<EnvironmentVariable>> {
+        let mut variables = self.read_object_dir("objects/environment-variables")?;
+        variables.sort_by(|a: &EnvironmentVariable, b| {
+            a.environment_id
+                .cmp(&b.environment_id)
+                .then_with(|| a.scope.stable_key().cmp(&b.scope.stable_key()))
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        Ok(variables)
+    }
+
+    pub fn list_environment_variable_versions(&self) -> Result<Vec<EnvironmentVariableVersion>> {
+        let mut versions = self.read_object_dir("objects/environment-variable-versions")?;
+        versions.sort_by(|a: &EnvironmentVariableVersion, b| {
+            a.variable_id
+                .cmp(&b.variable_id)
+                .then_with(|| a.created_at_unix_ms.cmp(&b.created_at_unix_ms))
+        });
+        Ok(versions)
     }
 
     pub fn add_integration(&self, provider: String) -> Result<IntegrationActor> {
@@ -885,6 +954,8 @@ impl LocalRepo {
             "objects/operations",
             "objects/policies",
             "objects/environments",
+            "objects/environment-variables",
+            "objects/environment-variable-versions",
             "objects/integrations",
             "objects/secrets",
             "workspaces",
@@ -903,8 +974,9 @@ impl LocalRepo {
     #[allow(dead_code)]
     fn scan_working_tree(&self, persist_blobs: bool) -> Result<TreeSnapshot> {
         let config = self.config()?;
+        let ignore = self.ignore_matcher()?;
         let mut entries = Vec::new();
-        self.scan_dir(&self.root, &mut entries, persist_blobs)?;
+        self.scan_dir(&self.root, &mut entries, persist_blobs, &ignore)?;
         TreeSnapshot::canonical(config.repository_id, Vec::new(), entries, BTreeMap::new())
             .map_err(Into::into)
     }
@@ -915,10 +987,11 @@ impl LocalRepo {
         catalog: &LocalWorkspaceCatalog,
         persist_blobs: bool,
     ) -> Result<TreeSnapshot> {
+        let ignore = self.ignore_matcher()?;
         if catalog.dirty_paths.is_empty() {
             let config = self.config()?;
             let mut entries = Vec::new();
-            self.scan_dir(&self.root, &mut entries, persist_blobs)?;
+            self.scan_dir(&self.root, &mut entries, persist_blobs, &ignore)?;
             return TreeSnapshot::canonical(
                 config.repository_id,
                 vec![base.id.clone()],
@@ -932,11 +1005,16 @@ impl LocalRepo {
             .iter()
             .map(|entry| (entry.path.clone(), entry.clone()))
             .collect::<BTreeMap<_, _>>();
-        entries.retain(|path, _| !should_skip(Path::new(path)));
+        entries.retain(|path, entry| {
+            !ignore.is_ignored(Path::new(path), entry.kind == TreeEntryKind::Directory)
+        });
         for dirty_path in &catalog.dirty_paths {
             let dirty_path =
                 normalize_repo_path(dirty_path).map_err(|error| anyhow::anyhow!(error))?;
-            if should_skip(Path::new(&dirty_path)) {
+            let is_dir = fs::symlink_metadata(self.root.join(&dirty_path))
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+            if ignore.is_ignored(Path::new(&dirty_path), is_dir) {
                 continue;
             }
             let path = self.root.join(&dirty_path);
@@ -973,6 +1051,7 @@ impl LocalRepo {
         dir: &Path,
         entries: &mut Vec<TreeEntry>,
         persist_blobs: bool,
+        ignore: &IgnoreMatcher,
     ) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -980,13 +1059,13 @@ impl LocalRepo {
             let relative = path
                 .strip_prefix(&self.root)
                 .context("working tree path should be under repo root")?;
-            if should_skip(relative) {
+            let metadata = fs::symlink_metadata(&path)?;
+            if ignore.is_ignored(relative, metadata.is_dir()) {
                 continue;
             }
-            let metadata = fs::symlink_metadata(&path)?;
             if metadata.is_dir() {
                 entries.push(TreeEntry::directory(path_to_repo_string(relative))?);
-                self.scan_dir(&path, entries, persist_blobs)?;
+                self.scan_dir(&path, entries, persist_blobs, ignore)?;
                 continue;
             }
             if metadata.file_type().is_symlink() {
@@ -1098,6 +1177,24 @@ impl LocalRepo {
 
     pub fn config(&self) -> Result<LocalConfig> {
         self.read_json(&self.nebula_dir.join("config.json"))
+    }
+
+    fn ignore_matcher(&self) -> Result<IgnoreMatcher> {
+        let config = self.config()?;
+        let defaults = DEFAULT_PATTERNS.join("\n");
+        let config_patterns = config.ignore.join("\n");
+        let nebignore_path = self.root.join(IGNORE_FILE_NAME);
+        let nebignore = if nebignore_path.exists() {
+            fs::read_to_string(&nebignore_path)
+                .with_context(|| format!("failed to read {}", nebignore_path.display()))?
+        } else {
+            String::new()
+        };
+        IgnoreMatcher::build([
+            defaults.as_str(),
+            config_patterns.as_str(),
+            nebignore.as_str(),
+        ])
     }
 
     fn write_config(&self, config: &LocalConfig) -> Result<()> {
@@ -1398,6 +1495,11 @@ impl LocalRepo {
         let operations: Vec<Operation> = self.read_object_dir("objects/operations")?;
         let git_migration_records: Vec<GitMigrationRecord> =
             self.read_object_dir("objects/git-migrations")?;
+        let environment_variables: Vec<EnvironmentVariable> =
+            self.read_object_dir("objects/environment-variables")?;
+        let environment_variable_versions: Vec<EnvironmentVariableVersion> =
+            self.read_object_dir("objects/environment-variable-versions")?;
+        let environments = self.list_environments()?;
         let mut blobs = BTreeMap::new();
         for snapshot in &snapshots {
             for entry in &snapshot.entries {
@@ -1449,6 +1551,9 @@ impl LocalRepo {
             proposals,
             operations,
             git_migration_records,
+            environment_variables,
+            environment_variable_versions,
+            environments,
             blobs: blobs.into_values().collect(),
         })
     }
@@ -1461,6 +1566,11 @@ impl LocalRepo {
         let operations: Vec<Operation> = self.read_object_dir("objects/operations")?;
         let git_migration_records: Vec<GitMigrationRecord> =
             self.read_object_dir("objects/git-migrations")?;
+        let environment_variables: Vec<EnvironmentVariable> =
+            self.read_object_dir("objects/environment-variables")?;
+        let environment_variable_versions: Vec<EnvironmentVariableVersion> =
+            self.read_object_dir("objects/environment-variable-versions")?;
+        let environments = self.list_environments()?;
         let mut blobs = BTreeMap::new();
         for snapshot in &snapshots {
             for entry in &snapshot.entries {
@@ -1508,6 +1618,9 @@ impl LocalRepo {
             proposals,
             operations,
             git_migration_records,
+            environment_variables,
+            environment_variable_versions,
+            environments,
             blobs: blobs.into_values().collect(),
         })
     }
@@ -1534,8 +1647,25 @@ impl LocalRepo {
                 record,
             )?;
         }
+        for variable in &bundle.environment_variables {
+            self.write_environment_variable(variable)?;
+        }
+        for version in &bundle.environment_variable_versions {
+            self.write_environment_variable_version(version)?;
+        }
+        for environment in &bundle.environments {
+            self.write_json(&self.environment_path(&environment.id), environment)?;
+        }
         for blob in &bundle.blobs {
-            if blob.bytes.is_empty() {
+            if blob.blob.size_bytes == 0 {
+                // A genuinely empty (0-byte) blob: `blob.bytes.is_empty()` is
+                // true both for this case and for the "large blob streamed
+                // separately, not inlined" case below, so size_bytes is the
+                // only reliable discriminator. Nothing to fetch or verify —
+                // just materialize the empty file.
+                verify_blob_bytes(&blob.blob, &blob.bytes)?;
+                self.write_blob(&blob.blob, &blob.bytes)?;
+            } else if blob.bytes.is_empty() {
                 let path = self.blob_path(&blob.blob.hash);
                 if !path.exists() {
                     bail!(
@@ -1631,6 +1761,21 @@ impl LocalRepo {
     fn environment_path(&self, id: &EnvironmentId) -> PathBuf {
         self.nebula_dir
             .join("objects/environments")
+            .join(format!("{}.json", safe_name(id.as_str())))
+    }
+
+    fn environment_variable_path(&self, id: &EnvironmentVariableId) -> PathBuf {
+        self.nebula_dir
+            .join("objects/environment-variables")
+            .join(format!("{}.json", safe_name(id.as_str())))
+    }
+
+    fn environment_variable_version_path(
+        &self,
+        id: &nebula_core::EnvironmentVariableVersionId,
+    ) -> PathBuf {
+        self.nebula_dir
+            .join("objects/environment-variable-versions")
             .join(format!("{}.json", safe_name(id.as_str())))
     }
 
@@ -1904,39 +2049,6 @@ fn create_symlink(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[allow(dead_code)]
-fn should_skip(relative: &Path) -> bool {
-    let Some(first) = relative.components().next() else {
-        return true;
-    };
-    let first = first.as_os_str().to_string_lossy();
-    if matches!(
-        first.as_ref(),
-        ".nebula"
-            | ".git"
-            | ".agents"
-            | ".cursor"
-            | ".mastra"
-            | "target"
-            | "node_modules"
-            | ".next"
-            | ".turbo"
-    ) {
-        return true;
-    }
-    relative
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name == ".DS_Store"
-                || name == "tsconfig.tsbuildinfo"
-                || name == "zero.db"
-                || name == "zero.db-shm"
-                || name == "zero.db-wal"
-                || name == "zero.db-wal2"
-        })
-}
-
-#[allow(dead_code)]
 fn path_to_repo_string(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
@@ -2074,6 +2186,37 @@ mod tests {
         fs::create_dir_all(&target_root).unwrap();
         let target = LocalRepo::init(&target_root).unwrap();
         assert!(target.import_bundle(&bundle).is_err());
+    }
+
+    #[test]
+    fn ignore_rules_skip_nested_defaults_and_respect_nebignore_and_config() {
+        let root = unique_temp_dir("nebula-local-ignore");
+        fs::create_dir_all(root.join("apps/platform/node_modules")).unwrap();
+        fs::write(root.join("apps/platform/node_modules/pkg.js"), "x").unwrap();
+        fs::write(root.join("apps/platform/app.txt"), "keep").unwrap();
+        fs::write(root.join("debug.log"), "drop via nebignore").unwrap();
+        fs::write(root.join("dist.bin"), "drop via config").unwrap();
+        fs::write(root.join("keep.bin"), "kept via negation").unwrap();
+        fs::write(root.join(".nebignore"), "*.log\n!keep.bin\n").unwrap();
+
+        let repo = LocalRepo::init(&root).unwrap();
+        let mut config = repo.config().unwrap();
+        config.ignore = vec!["*.bin".to_string()];
+        repo.write_config(&config).unwrap();
+
+        let save = repo.save(Some("initial".to_string())).unwrap();
+        let paths: BTreeSet<_> = save
+            .snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+
+        assert!(paths.contains("apps/platform/app.txt"));
+        assert!(!paths.iter().any(|path| path.contains("node_modules")));
+        assert!(!paths.contains("debug.log"));
+        assert!(!paths.contains("dist.bin"));
+        assert!(paths.contains("keep.bin"));
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

@@ -20,7 +20,7 @@ Use this checklist before publishing a public tag, binary, container, or hosted 
 - Production validation against durable object storage
 - Auth configured with Better Auth RS (`NEBULA_AUTH_PROVIDER=better-auth-rs`, `NEBULA_AUTH_BASE_URL`, `NEBULA_AUTH_SECRET`) or an explicitly accepted JWKS migration mode
 - Admin telemetry API configured with `NEBULA_ADMIN_API_ENABLED=true`, a bootstrap platform admin, and Better Auth protected access checks
-- Signed telemetry webhook test delivery validated, including Horizon/Lucity routing if a dedicated registry telemetry endpoint exists
+- Signed telemetry webhook test delivery validated, including Horizon routing if a dedicated registry telemetry endpoint exists
 - Tenant auth evidence from `tests/production/tenant-auth-scenarios.md`
 - Restore drill evidence recorded for the target environment
 - Backup and retention plan reviewed by a release owner

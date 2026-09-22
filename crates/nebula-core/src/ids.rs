@@ -43,6 +43,8 @@ id_type!(ProposalId, "prop");
 id_type!(MergeIntentId, "merge");
 id_type!(ReleaseGateId, "gate");
 id_type!(EnvironmentId, "env");
+id_type!(EnvironmentVariableId, "envvar");
+id_type!(EnvironmentVariableVersionId, "envval");
 id_type!(PolicyId, "pol");
 id_type!(ProjectionId, "proj");
 id_type!(DeploymentGrantId, "grant");

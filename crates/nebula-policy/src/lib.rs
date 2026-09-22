@@ -1,6 +1,6 @@
 use nebula_core::{
-    Actor, PolicyAction, PolicyDecision, PolicyEngine, PolicyObject, PolicyRequest, RepositoryId,
-    VisibilityPolicy,
+    Actor, AuthTokenId, PolicyAction, PolicyDecision, PolicyEngine, PolicyObject, PolicyRequest,
+    RepositoryId, VisibilityPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -34,6 +34,7 @@ namespace Nebula {
   entity Projection;
   entity GitExport;
   entity VectorJob;
+  entity EnvironmentVariable;
 
   action ReadBlob appliesTo {
     principal: [User, Team, Agent, Integration, Public],
@@ -115,6 +116,66 @@ namespace Nebula {
     resource: [DeploymentGrant, ReleaseGate, Environment],
     context: { environment?: EnvironmentName }
   };
+  action ManageVariables appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [EnvironmentVariable, Environment],
+    context: { environment?: EnvironmentName }
+  };
+  action ReadVariableMetadata appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [EnvironmentVariable, Environment],
+    context: { environment?: EnvironmentName }
+  };
+  action ReadEncryptedVariable appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [EnvironmentVariable],
+    context: { environment?: EnvironmentName }
+  };
+  action ReadVariableValue appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [EnvironmentVariable],
+    context: { environment?: EnvironmentName }
+  };
+  action InjectVariable appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [EnvironmentVariable, BuildSource],
+    context: { environment?: EnvironmentName }
+  };
+  action RevealVariable appliesTo {
+    principal: [User, Team],
+    resource: [EnvironmentVariable],
+    context: { environment?: EnvironmentName }
+  };
+  action SaveSecret appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [EnvironmentVariable],
+    context: { environment?: EnvironmentName }
+  };
+  action PushSecret appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [EnvironmentVariable],
+    context: { environment?: EnvironmentName }
+  };
+  action ExportSecret appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [EnvironmentVariable],
+    context: { environment?: EnvironmentName }
+  };
+  action UseWorkspaceForDeploy appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [Workspace, DeploymentGrant],
+    context: { environment?: EnvironmentName }
+  };
+  action MutateDeployVariables appliesTo {
+    principal: [User, Team, Agent, Integration],
+    resource: [EnvironmentVariable, DeploymentGrant],
+    context: { environment?: EnvironmentName }
+  };
+  action ManageVariablePolicy appliesTo {
+    principal: [User, Team],
+    resource: [EnvironmentVariable, Galaxy],
+    context: { environment?: EnvironmentName }
+  };
 }
 "#;
 
@@ -133,6 +194,8 @@ pub enum AuthorizationError {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthorizationRequest {
     pub actor: Actor,
+    #[serde(default)]
+    pub token_id: Option<AuthTokenId>,
     pub action: PolicyAction,
     pub repository_id: RepositoryId,
     pub resource_kind: String,
@@ -216,10 +279,17 @@ impl CedarNebulaAuthorizer {
         let evaluation = engine.evaluate(&PolicyRequest {
             repository_id: request.repository_id.clone(),
             actor: request.actor.clone(),
+            token_id: request.token_id.clone(),
             environment: None,
             action: request.action.clone(),
             object: PolicyObject::Path(path.to_string()),
             path: request.path.clone(),
+            key: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            deploy_source: None,
         });
         let decision = match (cedar_decision, evaluation.decision) {
             (Some(PolicyDecision::Block), _) | (_, PolicyDecision::Block) => PolicyDecision::Block,
@@ -445,6 +515,7 @@ mod tests {
         assert_eq!(report.policy_count, 0);
         let result = authorizer.authorize(AuthorizationRequest {
             actor: Actor::User("u1".to_string()),
+            token_id: None,
             action: PolicyAction::ReadBlob,
             repository_id: RepositoryId::new("repo_1"),
             resource_kind: "Blob".to_string(),
@@ -465,9 +536,15 @@ mod tests {
             priority: 1,
             rules: vec![PolicyRule {
                 actor: Actor::User("u1".to_string()),
+                token_id: None,
                 environment_id: None,
                 environment_kind: None,
                 path_glob: Some("src/**".to_string()),
+                key_glob: None,
+                service_id: None,
+                workspace_id: None,
+                sensitivity: None,
+                availability: None,
                 actions: vec![PolicyAction::ReadBlob],
                 decision: PolicyDecision::Allow,
                 reason: Some("test allow".to_string()),
@@ -475,6 +552,7 @@ mod tests {
         }]);
         let result = authorizer.authorize(AuthorizationRequest {
             actor: Actor::User("u1".to_string()),
+            token_id: None,
             action: PolicyAction::ReadBlob,
             repository_id,
             resource_kind: "Blob".to_string(),
@@ -497,9 +575,15 @@ mod tests {
             priority: 1,
             rules: vec![PolicyRule {
                 actor: Actor::User("u1".to_string()),
+                token_id: None,
                 environment_id: None,
                 environment_kind: None,
                 path_glob: Some("secrets/**".to_string()),
+                key_glob: None,
+                service_id: None,
+                workspace_id: None,
+                sensitivity: None,
+                availability: None,
                 actions: vec![PolicyAction::ReadSecret],
                 decision: PolicyDecision::Redact,
                 reason: Some("secret reads are redacted".to_string()),
@@ -507,6 +591,7 @@ mod tests {
         }]);
         let result = authorizer.authorize(AuthorizationRequest {
             actor: Actor::User("u1".to_string()),
+            token_id: None,
             action: PolicyAction::ReadSecret,
             repository_id,
             resource_kind: "Secret".to_string(),
@@ -528,9 +613,15 @@ mod tests {
             priority: 1,
             rules: vec![PolicyRule {
                 actor: Actor::User("u1".to_string()),
+                token_id: None,
                 environment_id: None,
                 environment_kind: None,
                 path_glob: Some("src/**".to_string()),
+                key_glob: None,
+                service_id: None,
+                workspace_id: None,
+                sensitivity: None,
+                availability: None,
                 actions: vec![PolicyAction::ReadBlob],
                 decision: PolicyDecision::Allow,
                 reason: Some("repo a only".to_string()),
@@ -538,6 +629,7 @@ mod tests {
         }]);
         let result = authorizer.authorize(AuthorizationRequest {
             actor: Actor::User("u1".to_string()),
+            token_id: None,
             action: PolicyAction::ReadBlob,
             repository_id: repo_b,
             resource_kind: "Blob".to_string(),

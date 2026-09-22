@@ -855,13 +855,13 @@ pub fn verify_git_migration(output: &GitMigrationOutput) -> GitMigrationVerifica
             ));
         }
         for entry in &snapshot.entries {
-            if let Some(hash) = &entry.hash {
-                if !blob_hashes.contains(hash) {
-                    errors.push(format!(
-                        "snapshot {} entry {} references missing blob {}:{}",
-                        snapshot.id, entry.path, hash.algorithm, hash.digest
-                    ));
-                }
+            if let Some(hash) = &entry.hash
+                && !blob_hashes.contains(hash)
+            {
+                errors.push(format!(
+                    "snapshot {} entry {} references missing blob {}:{}",
+                    snapshot.id, entry.path, hash.algorithm, hash.digest
+                ));
             }
         }
     }

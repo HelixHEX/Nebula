@@ -13,12 +13,14 @@ categories = ["development-tools", "web-programming"]
 publish = false
 
 [dependencies]
+aes-gcm = "0.11.0"
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 flate2 = "1.1.9"
 futures.workspace = true
 hex.workspace = true
+hmac = "0.12.1"
 nebula-auth = { path = "../nebula-auth" }
 nebula-core = { path = "../nebula-core" }
 nebula-git = { path = "../nebula-git" }

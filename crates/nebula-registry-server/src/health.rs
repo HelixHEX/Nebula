@@ -1,13 +1,7 @@
-use axum::{Json, http::StatusCode, response::IntoResponse};
+use axum::{http::StatusCode, response::IntoResponse};
 use nebula_storage::{ObjectBlobStore, PgVectorManifestStore, PostgresMetadataStore};
 use serde::Serialize;
 use std::time::Instant;
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Probe {
-    pub status: String,
-    pub checks: Vec<String>,
-}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DependencyProbe {
@@ -84,16 +78,6 @@ impl MetricsSnapshot {
     }
 }
 
-pub async fn live() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(Probe {
-            status: "live".to_string(),
-            checks: Vec::new(),
-        }),
-    )
-}
-
 pub async fn metrics(snapshot: MetricsSnapshot) -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -110,37 +94,6 @@ pub async fn metrics(snapshot: MetricsSnapshot) -> impl IntoResponse {
             snapshot.deploy_callbacks_total,
             snapshot.latency_micros_total
         ),
-    )
-}
-
-pub async fn ready(state: ReadinessState) -> impl IntoResponse {
-    let report = ready_report(state).await;
-    let checks = report
-        .checks
-        .iter()
-        .map(|check| {
-            if check.status == "ok" {
-                format!("{}:ok", check.name)
-            } else {
-                format!("{}:{}", check.name, check.detail)
-            }
-        })
-        .collect::<Vec<_>>();
-    if report.status != "ready" {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(Probe {
-                status: "not_ready".to_string(),
-                checks,
-            }),
-        );
-    }
-    (
-        StatusCode::OK,
-        Json(Probe {
-            status: "ready".to_string(),
-            checks,
-        }),
     )
 }
 

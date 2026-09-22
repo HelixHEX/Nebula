@@ -8,7 +8,7 @@ use nebula_core::{
     VectorIndexManifestId, VectorIndexStore,
 };
 use object_store::{
-    ObjectStore, WriteMultipart,
+    ObjectStore, ObjectStoreExt, WriteMultipart,
     aws::{AmazonS3, AmazonS3Builder},
     path::Path as ObjectPath,
     signer::Signer,
@@ -659,7 +659,7 @@ impl PostgresMetadataStore {
             r#"
             SELECT object_json
             FROM nebula_registry_objects
-            WHERE object_kind = 'blob'
+            WHERE object_kind IN ('blob', 'oci_blob')
             "#,
         )
         .fetch_all(&self.pool)
@@ -667,9 +667,15 @@ impl PostgresMetadataStore {
         .map_err(sqlx_error)?;
         let mut hashes = Vec::new();
         for value in rows {
-            let blob: ContentBlob = serde_json::from_value(value)
-                .map_err(|error| NebulaError::Storage(error.to_string()))?;
-            hashes.push(blob.hash);
+            if let Ok(blob) = serde_json::from_value::<ContentBlob>(value.clone()) {
+                hashes.push(blob.hash);
+                continue;
+            }
+            if let Some(digest) = value.get("digest").and_then(|v| v.as_str())
+                && let Some(hash) = content_hash_from_oci_digest(digest)
+            {
+                hashes.push(hash);
+            }
         }
         hashes.sort();
         hashes.dedup();
@@ -1014,6 +1020,64 @@ impl RegistryStore for PostgresMetadataStore {
         Ok(())
     }
 
+    async fn get_resources_scoped_batch(
+        &self,
+        repository_id: Option<&RepositoryId>,
+        kind: &str,
+        ids: &[String],
+    ) -> NebulaResult<Vec<(String, serde_json::Value)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(
+            r#"
+            SELECT object_id, object_json
+            FROM nebula_registry_objects
+            WHERE object_kind = $1
+              AND repository_id = $2
+              AND object_id = ANY($3)
+            "#,
+        )
+        .bind(kind)
+        .bind(
+            repository_id
+                .map(RepositoryId::as_str)
+                .unwrap_or(GLOBAL_REPOSITORY_SCOPE),
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(sqlx_error)
+    }
+
+    async fn delete_resources_batch(
+        &self,
+        repository_id: Option<&RepositoryId>,
+        kind: &str,
+        ids: &[String],
+    ) -> NebulaResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            DELETE FROM nebula_registry_objects
+            WHERE repository_id = $1 AND object_kind = $2 AND object_id = ANY($3)
+            "#,
+        )
+        .bind(
+            repository_id
+                .map(RepositoryId::as_str)
+                .unwrap_or(GLOBAL_REPOSITORY_SCOPE),
+        )
+        .bind(kind)
+        .bind(ids)
+        .execute(&self.pool)
+        .await
+        .map_err(sqlx_error)?;
+        Ok(())
+    }
+
     async fn put_resource_idempotent(
         &self,
         repository_id: Option<&RepositoryId>,
@@ -1283,43 +1347,27 @@ impl RegistryStore for PostgresMetadataStore {
 
         for ref_update in &transaction.ref_updates {
             let id = format!("{}_{}", ref_update.repository_id.as_str(), ref_update.name);
-            if ref_update.expected_target.is_none() {
-                sqlx::query(
-                    r#"
-                    INSERT INTO nebula_registry_objects (object_kind, object_id, repository_id, object_json)
-                    VALUES ('ref', $1, $2, $3)
-                    ON CONFLICT (repository_id, object_kind, object_id)
-                    DO UPDATE SET
-                        repository_id = EXCLUDED.repository_id,
-                        object_json = EXCLUDED.object_json,
-                        updated_at = NOW()
-                    "#,
-                )
-                .bind(&id)
-                .bind(ref_update.repository_id.as_str())
-                .bind(&ref_update.next_ref)
-                .execute(&mut *tx)
-                .await
-                .map_err(sqlx_error)?;
-            } else {
-                sqlx::query(
-                    r#"
-                    INSERT INTO nebula_registry_objects (object_kind, object_id, repository_id, object_json)
-                    VALUES ('ref', $1, $2, $3)
-                    ON CONFLICT (repository_id, object_kind, object_id)
-                    DO UPDATE SET
-                        repository_id = EXCLUDED.repository_id,
-                        object_json = EXCLUDED.object_json,
-                        updated_at = NOW()
-                    "#,
-                )
-                .bind(&id)
-                .bind(ref_update.repository_id.as_str())
-                .bind(&ref_update.next_ref)
-                .execute(&mut *tx)
-                .await
-                .map_err(sqlx_error)?;
-            }
+            // The compare-and-swap check against `expected_target` already
+            // happened above (the `FOR UPDATE` read-and-compare loop), so
+            // this write is unconditional regardless of whether the ref is
+            // being created or updated.
+            sqlx::query(
+                r#"
+                INSERT INTO nebula_registry_objects (object_kind, object_id, repository_id, object_json)
+                VALUES ('ref', $1, $2, $3)
+                ON CONFLICT (repository_id, object_kind, object_id)
+                DO UPDATE SET
+                    repository_id = EXCLUDED.repository_id,
+                    object_json = EXCLUDED.object_json,
+                    updated_at = NOW()
+                "#,
+            )
+            .bind(&id)
+            .bind(ref_update.repository_id.as_str())
+            .bind(&ref_update.next_ref)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_error)?;
         }
 
         sqlx::query(
@@ -1449,7 +1497,7 @@ impl ObjectBlobStore {
         if self.prefix.as_ref().is_empty() {
             ObjectPath::from(path)
         } else {
-            self.prefix.child(path)
+            self.prefix.clone().join(path)
         }
     }
 
@@ -1478,6 +1526,28 @@ impl ObjectBlobStore {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(error) => Err(object_store_error(error)),
         }
+    }
+
+    /// Stream object bytes without buffering the full payload in memory.
+    pub async fn get_byte_stream(
+        &self,
+        hash: &ContentHash,
+    ) -> NebulaResult<(
+        u64,
+        Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    )> {
+        let result = self
+            .store
+            .get(&self.object_path(hash))
+            .await
+            .map_err(object_store_error)?;
+        let size = result.meta.size as u64;
+        let stream = result.into_stream().map(|chunk| {
+            chunk
+                .map_err(|error| std::io::Error::other(error.to_string()))
+                .map(|bytes| Bytes::from(bytes.to_vec()))
+        });
+        Ok((size, Box::pin(stream)))
     }
 
     fn staged_object_path(&self, hash: &ContentHash) -> ObjectPath {
@@ -1885,6 +1955,17 @@ impl VectorIndexStore for PgVectorManifestStore {
 
 fn storage_error(error: std::io::Error) -> NebulaError {
     NebulaError::Storage(error.to_string())
+}
+
+fn content_hash_from_oci_digest(raw: &str) -> Option<ContentHash> {
+    let digest = raw.strip_prefix("sha256:")?;
+    if digest.len() != 64 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(ContentHash {
+        algorithm: "sha256".to_string(),
+        digest: digest.to_string(),
+    })
 }
 
 fn sqlx_error(error: sqlx::Error) -> NebulaError {

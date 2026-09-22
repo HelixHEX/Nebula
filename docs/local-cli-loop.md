@@ -27,6 +27,25 @@ Phase 3 gives `neb` a real local workflow before remote registry sync exists.
 
 The blob store is content-addressed using `ContentHash::object_path()`.
 
+## Ignoring Paths
+
+Nebula always excludes its own metadata and a small set of common build
+directories (`.nebula`, `.git`, `node_modules`, `.next`, `.turbo`, `target`,
+etc.), no matter how deeply nested they are.
+
+You can add repository-specific exclusions from two places, layered on top of
+the built-in defaults:
+
+- The `ignore` array in `.nebula/config.json`.
+- A root `.nebignore` file, using gitignore-style syntax (`#` comments, `!`
+  negation, trailing `/` for directory-only patterns). `.nebignore` is applied
+  last, so it can override both the defaults and `config.json` — for example
+  `!some/default/ignored/path` un-ignores a path that would otherwise be
+  skipped.
+
+`status`, `diff`, and `save` all honor these rules when scanning the working
+tree.
+
 ## Commands
 
 Initialize local metadata:

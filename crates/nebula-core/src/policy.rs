@@ -1,5 +1,5 @@
 use crate::model::*;
-use crate::{EnvironmentId, PolicyId, RepositoryId};
+use crate::{AuthTokenId, EnvironmentId, PolicyId, RepositoryId, WorkspaceId};
 use globset::Glob;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,9 +16,21 @@ pub struct VisibilityPolicy {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct PolicyRule {
     pub actor: Actor,
+    #[serde(default)]
+    pub token_id: Option<AuthTokenId>,
     pub environment_id: Option<EnvironmentId>,
     pub environment_kind: Option<EnvironmentKind>,
     pub path_glob: Option<String>,
+    #[serde(default)]
+    pub key_glob: Option<String>,
+    #[serde(default)]
+    pub service_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default)]
+    pub sensitivity: Option<VariableSensitivity>,
+    #[serde(default)]
+    pub availability: Option<VariableAvailability>,
     pub actions: Vec<PolicyAction>,
     pub decision: PolicyDecision,
     pub reason: Option<String>,
@@ -28,10 +40,24 @@ pub struct PolicyRule {
 pub struct PolicyRequest {
     pub repository_id: RepositoryId,
     pub actor: Actor,
+    #[serde(default)]
+    pub token_id: Option<AuthTokenId>,
     pub environment: Option<Environment>,
     pub action: PolicyAction,
     pub object: PolicyObject,
     pub path: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub service_id: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
+    #[serde(default)]
+    pub sensitivity: Option<VariableSensitivity>,
+    #[serde(default)]
+    pub availability: Option<VariableAvailability>,
+    #[serde(default)]
+    pub deploy_source: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -72,6 +98,11 @@ impl PolicyEngine {
                 if !actor_matches(&rule.actor, &request.actor) {
                     continue;
                 }
+                if let Some(token_id) = &rule.token_id
+                    && request.token_id.as_ref() != Some(token_id)
+                {
+                    continue;
+                }
                 if !rule.actions.contains(&request.action) {
                     continue;
                 }
@@ -98,6 +129,34 @@ impl PolicyEngine {
                     if !path_glob_matches(glob, path) {
                         continue;
                     }
+                }
+                if let Some(glob) = &rule.key_glob {
+                    let Some(key) = &request.key else {
+                        continue;
+                    };
+                    if !path_glob_matches(glob, key) {
+                        continue;
+                    }
+                }
+                if let Some(service_id) = &rule.service_id
+                    && request.service_id.as_ref() != Some(service_id)
+                {
+                    continue;
+                }
+                if let Some(workspace_id) = &rule.workspace_id
+                    && request.workspace_id.as_ref() != Some(workspace_id)
+                {
+                    continue;
+                }
+                if let Some(sensitivity) = &rule.sensitivity
+                    && request.sensitivity.as_ref() != Some(sensitivity)
+                {
+                    continue;
+                }
+                if let Some(availability) = &rule.availability
+                    && request.availability.as_ref() != Some(availability)
+                {
+                    continue;
                 }
                 matches.push(PolicyAuditRecord {
                     policy_id: policy.id.clone(),
@@ -167,10 +226,17 @@ mod tests {
         let decision = engine.evaluate(&PolicyRequest {
             repository_id,
             actor: Actor::Integration("vercel".to_string()),
+            token_id: None,
             environment: None,
             action: PolicyAction::ReadBlob,
             object: PolicyObject::Path(".env.production".to_string()),
             path: Some(".env.production".to_string()),
+            key: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            deploy_source: None,
         });
 
         assert_eq!(decision.decision, PolicyDecision::Block);
@@ -186,9 +252,15 @@ mod tests {
             priority: 100,
             rules: vec![PolicyRule {
                 actor: Actor::Integration("vercel".to_string()),
+                token_id: None,
                 environment_id: None,
                 environment_kind: Some(EnvironmentKind::Production),
                 path_glob: Some("packages/proprietary-engine/**".to_string()),
+                key_glob: None,
+                service_id: None,
+                workspace_id: None,
+                sensitivity: None,
+                availability: None,
                 actions: vec![PolicyAction::ReadBuildSource],
                 decision: PolicyDecision::Allow,
                 reason: Some("vercel can read production build source".to_string()),
@@ -197,6 +269,7 @@ mod tests {
         let decision = engine.evaluate(&PolicyRequest {
             repository_id: repository_id.clone(),
             actor: Actor::Integration("vercel".to_string()),
+            token_id: None,
             environment: Some(Environment {
                 id: EnvironmentId::generated(),
                 repository_id,
@@ -206,6 +279,12 @@ mod tests {
             action: PolicyAction::ReadBuildSource,
             object: PolicyObject::Path("packages/proprietary-engine/index.ts".to_string()),
             path: Some("packages/proprietary-engine/index.ts".to_string()),
+            key: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            deploy_source: None,
         });
 
         assert_eq!(decision.decision, PolicyDecision::Allow);
@@ -223,9 +302,15 @@ mod tests {
             priority: 1,
             rules: vec![PolicyRule {
                 actor: Actor::Public,
+                token_id: None,
                 environment_id: None,
                 environment_kind: None,
                 path_glob: Some("**/*.ts".to_string()),
+                key_glob: None,
+                service_id: None,
+                workspace_id: None,
+                sensitivity: None,
+                availability: None,
                 actions: vec![PolicyAction::ReadBlob],
                 decision: PolicyDecision::Allow,
                 reason: None,
@@ -235,10 +320,17 @@ mod tests {
         let decision = engine.evaluate(&PolicyRequest {
             repository_id: request_repo_id,
             actor: Actor::Public,
+            token_id: None,
             environment: None,
             action: PolicyAction::ReadBlob,
             object: PolicyObject::Path("src/app.ts".to_string()),
             path: Some("src/app.ts".to_string()),
+            key: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            deploy_source: None,
         });
 
         assert_eq!(decision.decision, PolicyDecision::Block);
@@ -257,9 +349,15 @@ mod tests {
                 priority: 1000,
                 rules: vec![PolicyRule {
                     actor: Actor::Integration("vercel".to_string()),
+                    token_id: None,
                     environment_id: None,
                     environment_kind: Some(EnvironmentKind::Production),
                     path_glob: Some("**/*".to_string()),
+                    key_glob: None,
+                    service_id: None,
+                    workspace_id: None,
+                    sensitivity: None,
+                    availability: None,
                     actions: vec![PolicyAction::ExportGit],
                     decision: PolicyDecision::Allow,
                     reason: Some("broad export allow".to_string()),
@@ -272,9 +370,15 @@ mod tests {
                 priority: 1,
                 rules: vec![PolicyRule {
                     actor: Actor::Integration("vercel".to_string()),
+                    token_id: None,
                     environment_id: None,
                     environment_kind: Some(EnvironmentKind::Production),
                     path_glob: Some(".env.production".to_string()),
+                    key_glob: None,
+                    service_id: None,
+                    workspace_id: None,
+                    sensitivity: None,
+                    availability: None,
                     actions: vec![PolicyAction::ExportGit],
                     decision: PolicyDecision::Block,
                     reason: Some("production env cannot be exported to git".to_string()),
@@ -285,6 +389,7 @@ mod tests {
         let decision = engine.evaluate(&PolicyRequest {
             repository_id: repository_id.clone(),
             actor: Actor::Integration("vercel".to_string()),
+            token_id: None,
             environment: Some(Environment {
                 id: EnvironmentId::generated(),
                 repository_id,
@@ -294,6 +399,12 @@ mod tests {
             action: PolicyAction::ExportGit,
             object: PolicyObject::Path(".env.production".to_string()),
             path: Some(".env.production".to_string()),
+            key: None,
+            service_id: None,
+            workspace_id: None,
+            sensitivity: None,
+            availability: None,
+            deploy_source: None,
         });
 
         assert_eq!(decision.decision, PolicyDecision::Block);

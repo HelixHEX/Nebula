@@ -31,6 +31,7 @@ struct CredentialIndex {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CredentialMetadata {
     org_id: Option<String>,
+    #[serde(default)]
     repository_id: Option<String>,
     scopes: Vec<String>,
     storage: CredentialStorage,
@@ -66,14 +67,14 @@ pub fn store_credential(credential: StoredCredential) -> Result<CredentialStorag
     let token = credential.token;
 
     if keyring_enabled() && !plaintext_enabled() {
-        if let Ok(entry) = keyring_entry(&registry_key) {
-            if entry.set_password(&token).is_ok() {
-                upsert_index(registry_key.clone(), metadata)?;
-                return Ok(CredentialStorageSummary {
-                    registry_url: registry_key,
-                    storage: "keyring",
-                });
-            }
+        if let Ok(entry) = keyring_entry(&registry_key)
+            && entry.set_password(&token).is_ok()
+        {
+            upsert_index(registry_key.clone(), metadata)?;
+            return Ok(CredentialStorageSummary {
+                registry_url: registry_key,
+                storage: "keyring",
+            });
         }
         bail!(
             "could not write the OS keychain entry for {registry_key}; unset {KEYRING_ENV} to use the default secure plaintext store"

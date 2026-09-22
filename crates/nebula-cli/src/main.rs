@@ -5,15 +5,19 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use indicatif::{ProgressBar, ProgressStyle};
 use nebula_core::{
-    Actor, Environment, EnvironmentId, EnvironmentKind, PolicyAction, PolicyDecision,
-    ProjectionTarget, Proposal, ProposalId, RefId, RefTarget, ReviewState, TreeDiffKind,
-    TreeSnapshotId, VectorIndexManifestId,
+    Actor, ContentHash, Environment, EnvironmentId, EnvironmentKind, EnvironmentVariable,
+    EnvironmentVariableVersion, PolicyAction, PolicyDecision, ProjectionTarget, Proposal,
+    ProposalId, RefId, RefTarget, ReviewState, TreeDiffKind, TreeSnapshotId, VariableAvailability,
+    VariableScope, VariableSecretStorageMode, VariableSensitivity, VariableValueKind,
+    VectorIndexManifestId,
 };
 use nebula_local::{LocalBlobRecord, LocalRepo, LocalSyncBundle};
 use nebula_sync::{RegistrySyncClient, is_registry_remote};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(name = "neb")]
@@ -145,6 +149,145 @@ enum GalaxyCommand {
         #[arg(long)]
         org: Option<String>,
     },
+    DeployConfig {
+        #[command(subcommand)]
+        command: DeployConfigCommand,
+    },
+    Policy {
+        #[command(subcommand)]
+        command: GalaxyPolicyCommand,
+    },
+    /// Lists galaxies you're authorized to see.
+    List {
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        registry_url: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Shows a single galaxy's details.
+    Get {
+        /// Galaxy id (repo_...) or owner/name.
+        galaxy: String,
+        #[arg(long)]
+        registry_url: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+}
+
+/// Manages a galaxy's actor-authorization policies. The registry's
+/// authorization engine fails closed by default: even a token whose scope
+/// includes an action (e.g. `manage_deploy_config`) is denied until an
+/// explicit allow rule also exists for that actor. Requires a token with
+/// `nebula.repository:manage_auth` — granting access to other actors is an
+/// admin operation, not a self-service one.
+#[derive(Debug, Subcommand)]
+enum GalaxyPolicyCommand {
+    Grant {
+        /// Galaxy id (repo_...) or owner/name.
+        galaxy: String,
+        /// "public", or "<kind>:<id>" where kind is user, team, agent, or
+        /// integration (e.g. "integration:ci-deploy-config").
+        actor: String,
+        /// Action to allow, e.g. "manage_deploy_config" or "sync_objects".
+        /// Repeat for multiple actions.
+        #[arg(long = "action", required = true)]
+        actions: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        #[arg(long)]
+        reason: Option<String>,
+        /// Scope this grant to one specific auth token (tok_...), so other
+        /// tokens/sessions belonging to the same actor are not covered by
+        /// it. Useful because Better Auth API keys all resolve to the same
+        /// `user:<id>` actor — this is the only way to grant policy to one
+        /// CI token distinctly from the account's other credentials. Find a
+        /// token's id with `neb auth token list`. Omit for an account-wide
+        /// grant (the default, backward-compatible behavior).
+        #[arg(long = "token")]
+        token_id: Option<String>,
+        #[arg(long)]
+        registry_url: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Lists the actor-authorization policies granted on a galaxy.
+    List {
+        galaxy: String,
+        #[arg(long)]
+        registry_url: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Removes a previously granted policy (see `neb galaxy policy list` for
+    /// ids).
+    Revoke {
+        galaxy: String,
+        /// The policy id printed by `neb galaxy policy grant`/`list` (pol_...).
+        policy_id: String,
+        #[arg(long)]
+        registry_url: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+}
+
+/// Registers or inspects a galaxy's deploy config, which tells the registry
+/// where to send deploy-intent webhooks for a given service (e.g. a Horizon
+/// deployment target). Requires a token with the
+/// `nebula.repository:manage_deploy_config` scope — mint one with `neb auth
+/// token create ci --scope nebula.repository:manage_deploy_config`.
+#[derive(Debug, Subcommand)]
+enum DeployConfigCommand {
+    Set {
+        /// Galaxy id (repo_...) or owner/name.
+        galaxy: String,
+        /// Identifier for the deploy target within this galaxy (e.g. a
+        /// Horizon service ID). A galaxy can have multiple deploy configs,
+        /// one per service.
+        service_id: String,
+        /// Webhook URL the registry POSTs the deploy intent to.
+        #[arg(long)]
+        deploy_url: String,
+        /// Shared secret used to sign the webhook payload; must be at least
+        /// 16 characters.
+        #[arg(long)]
+        signing_secret: String,
+        #[arg(long, default_value = "horizon")]
+        provider_key: String,
+        #[arg(long)]
+        environment_id: Option<String>,
+        #[arg(long)]
+        environment_name: Option<String>,
+        #[arg(long)]
+        context_path: Option<String>,
+        /// Create a deploy intent when the galaxy default ref is updated (default: true).
+        #[arg(long = "auto-deploy", default_value_t = true)]
+        #[arg(long = "no-auto-deploy", action = clap::ArgAction::SetFalse)]
+        auto_deploy: bool,
+        #[arg(long)]
+        registry_url: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    Get {
+        galaxy: String,
+        service_id: String,
+        #[arg(long)]
+        registry_url: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    Delete {
+        galaxy: String,
+        service_id: String,
+        #[arg(long)]
+        registry_url: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -217,6 +360,16 @@ enum AuthCommand {
     Token {
         #[command(subcommand)]
         command: AuthTokenCommand,
+    },
+    /// Shows the actor identity, scopes, and repository binding your current
+    /// credential resolves to. Use the printed `actor` value directly with
+    /// `neb galaxy policy grant` — it's usually `user:<id>`, not the token's
+    /// display name.
+    Whoami {
+        #[arg(long)]
+        registry_url: Option<String>,
+        #[arg(long, default_value = "origin")]
+        remote: String,
     },
 }
 
@@ -357,6 +510,29 @@ enum OpsCommand {
         #[command(subcommand)]
         command: OpsRestoreCommand,
     },
+    Registry {
+        #[command(subcommand)]
+        command: OpsRegistryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OpsRegistryCommand {
+    /// Import a file-backed registry.json into Postgres + object store.
+    ImportFile {
+        /// Path to registry.json
+        #[arg(long)]
+        source: PathBuf,
+        /// Optional on-disk blob-store directory to copy (e.g. /data/blob-store)
+        #[arg(long)]
+        source_blob_store: Option<PathBuf>,
+        /// Dry-run: parse and count without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Run SQL migrations before import
+        #[arg(long, default_value_t = true)]
+        run_migrations: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -419,9 +595,45 @@ enum OpsRestoreCommand {
 
 #[derive(Debug, Subcommand)]
 enum EnvCommand {
-    List,
-    Create { name: String },
-    Configure { name: String },
+    List {
+        #[arg(long)]
+        environment: Option<String>,
+    },
+    Create {
+        name: String,
+    },
+    Configure {
+        name: String,
+    },
+    Set {
+        key: String,
+        #[arg(long)]
+        value: Option<String>,
+        #[arg(long, default_value = "development")]
+        environment: String,
+        #[arg(long)]
+        service: Option<String>,
+        #[arg(long = "scope")]
+        availability: Vec<String>,
+        #[arg(long)]
+        sensitive: bool,
+        #[arg(long)]
+        sealed: bool,
+        #[arg(long)]
+        save: bool,
+    },
+    Seal {
+        key: String,
+        #[arg(long, default_value = "production")]
+        environment: String,
+        #[arg(long)]
+        service: Option<String>,
+    },
+    Export {
+        #[arg(long, default_value = "development")]
+        environment: String,
+    },
+    Diff,
 }
 
 #[derive(Debug, Subcommand)]
@@ -503,6 +715,7 @@ fn run_command(command: Command, output: CliOutput) -> Result<()> {
                     }).collect::<Vec<_>>(),
                 }))?;
             } else if !output.quiet {
+                print_repo_header(&output, &repo, status.diff.entries.len());
                 println!("Workspace: {}", status.workspace.name);
                 print_diff_summary(&status.diff);
             }
@@ -510,6 +723,9 @@ fn run_command(command: Command, output: CliOutput) -> Result<()> {
         Command::Diff => {
             let repo = open_repo()?;
             let diff = repo.diff()?;
+            if !output.json && !output.quiet {
+                print_repo_header(&output, &repo, diff.entries.len());
+            }
             print_diff_entries(&diff.entries);
             println!(
                 "Compared {} tree node(s), skipped {} unchanged subtree(s).",
@@ -519,6 +735,9 @@ fn run_command(command: Command, output: CliOutput) -> Result<()> {
         Command::Save { message } => {
             let repo = open_repo()?;
             let result = repo.save(message)?;
+            if !output.json && !output.quiet {
+                print_repo_header(&output, &repo, result.diff.entries.len());
+            }
             println!("Saved snapshot {}", result.snapshot.id);
             println!("Created changeset {}", result.changeset.id);
             print_diff_summary(&result.diff);
@@ -532,7 +751,10 @@ fn run_command(command: Command, output: CliOutput) -> Result<()> {
             let repo = open_repo()?;
             if let Some(url) = remote_registry_url(&repo, remote.clone())? {
                 let progress = progress_spinner(output, "Pushing Nebula objects to registry");
-                let bundle = block_on_sync(sync_client(url)?.push_repo(&repo))?;
+                let remote_repo_id = remote_full_url(&repo, remote)
+                    .and_then(|u| parse_neb_remote_url(&u))
+                    .map(|parsed| parsed.repository_id);
+                let bundle = block_on_sync(sync_client(url)?.push_repo(&repo, remote_repo_id))?;
                 finish_progress(progress, "Push complete");
                 if output.json {
                     print_json(json!({
@@ -1017,12 +1239,41 @@ fn run_command(command: Command, output: CliOutput) -> Result<()> {
         Command::Env { command } => {
             let repo = open_repo()?;
             match command {
-                EnvCommand::List => {
-                    for environment in repo.list_environments()? {
-                        println!(
-                            "{}\t{}\t{:?}",
-                            environment.id, environment.name, environment.kind
-                        );
+                EnvCommand::List { environment } => {
+                    if let Some(environment_name) = environment {
+                        let environment = ensure_local_environment(&repo, &environment_name)?;
+                        let versions = repo.list_environment_variable_versions()?;
+                        for variable in repo
+                            .list_environment_variables()?
+                            .into_iter()
+                            .filter(|variable| variable.environment_id == environment.id)
+                        {
+                            let version = variable
+                                .current_version_id
+                                .as_ref()
+                                .and_then(|id| versions.iter().find(|version| &version.id == id));
+                            let masked = version
+                                .and_then(|version| version.fingerprint.as_deref())
+                                .map(|fingerprint| {
+                                    masked_fingerprint(&variable.sensitivity, fingerprint)
+                                })
+                                .unwrap_or_else(|| "[unset]".to_string());
+                            println!(
+                                "{}\t{}\t{:?}\t{:?}\t{}",
+                                variable.key,
+                                variable.scope.stable_key(),
+                                variable.availability,
+                                variable.sensitivity,
+                                masked
+                            );
+                        }
+                    } else {
+                        for environment in repo.list_environments()? {
+                            println!(
+                                "{}\t{}\t{:?}",
+                                environment.id, environment.name, environment.kind
+                            );
+                        }
                     }
                 }
                 EnvCommand::Create { name } => {
@@ -1038,6 +1289,167 @@ fn run_command(command: Command, output: CliOutput) -> Result<()> {
                         "Configured environment {}\t{}",
                         environment.id, environment.name
                     );
+                }
+                EnvCommand::Set {
+                    key,
+                    value,
+                    environment,
+                    service,
+                    availability,
+                    sensitive,
+                    sealed,
+                    save,
+                } => {
+                    let environment = ensure_local_environment(&repo, &environment)?;
+                    let value = match value {
+                        Some(value) => value,
+                        None => rpassword::prompt_password(format!("{key}: "))?,
+                    };
+                    let sensitivity = if sealed {
+                        VariableSensitivity::Sealed
+                    } else if sensitive || save || likely_secret_key(&key) {
+                        VariableSensitivity::Sensitive
+                    } else {
+                        VariableSensitivity::Encrypted
+                    };
+                    let scope = service
+                        .map(|service_id| VariableScope::Service { service_id })
+                        .unwrap_or(VariableScope::Shared);
+                    let availability = parse_variable_availability(availability)?;
+                    let variable_id = EnvironmentVariable::stable_id(
+                        &environment.repository_id,
+                        &environment.id,
+                        &scope,
+                        &key,
+                    );
+                    let now = now_unix_ms();
+                    let version = EnvironmentVariableVersion {
+                        id: nebula_core::EnvironmentVariableVersionId::generated(),
+                        repository_id: environment.repository_id.clone(),
+                        variable_id: variable_id.clone(),
+                        key: key.clone(),
+                        sensitivity: sensitivity.clone(),
+                        value_kind: if sensitivity.is_write_only() {
+                            VariableValueKind::Secret
+                        } else {
+                            VariableValueKind::Literal
+                        },
+                        storage_mode: if save {
+                            VariableSecretStorageMode::BlobBackedEncrypted
+                        } else if sensitivity.is_write_only() {
+                            VariableSecretStorageMode::MetadataOnly
+                        } else {
+                            VariableSecretStorageMode::RegistryEncrypted
+                        },
+                        plaintext_value: (!sensitivity.is_write_only()).then_some(value.clone()),
+                        ciphertext: None,
+                        content_hash: None,
+                        encryption_key_id: None,
+                        wrapped_data_key: None,
+                        nonce: None,
+                        fingerprint: Some(local_fingerprint(&key, &value)),
+                        value_digest: Some(ContentHash::sha256(value.as_bytes()).digest),
+                        redaction_tokens: Vec::new(),
+                        created_by: Some(Actor::Public),
+                        created_at_unix_ms: now,
+                        last_injected_at_unix_ms: None,
+                        last_used_by_deploy_id: None,
+                    };
+                    let variable = EnvironmentVariable {
+                        id: variable_id,
+                        repository_id: environment.repository_id,
+                        workspace_id: None,
+                        environment_id: environment.id,
+                        scope,
+                        key: key.clone(),
+                        value_kind: version.value_kind.clone(),
+                        availability,
+                        sensitivity: sensitivity.clone(),
+                        storage_mode: version.storage_mode.clone(),
+                        current_version_id: Some(version.id.clone()),
+                        reference: None,
+                        created_by: Some(Actor::Public),
+                        updated_by: Some(Actor::Public),
+                        created_at_unix_ms: now,
+                        updated_at_unix_ms: now,
+                    };
+                    repo.write_environment_variable_version(&version)?;
+                    repo.write_environment_variable(&variable)?;
+                    println!(
+                        "Set {}\t{:?}\t{}",
+                        key,
+                        sensitivity,
+                        masked_fingerprint(
+                            &sensitivity,
+                            version.fingerprint.as_deref().unwrap_or("")
+                        )
+                    );
+                }
+                EnvCommand::Seal {
+                    key,
+                    environment,
+                    service,
+                } => {
+                    let environment = ensure_local_environment(&repo, &environment)?;
+                    let scope = service
+                        .map(|service_id| VariableScope::Service { service_id })
+                        .unwrap_or(VariableScope::Shared);
+                    let variable_id = EnvironmentVariable::stable_id(
+                        &environment.repository_id,
+                        &environment.id,
+                        &scope,
+                        &key,
+                    );
+                    let variables = repo.list_environment_variables()?;
+                    let Some(mut variable) = variables
+                        .into_iter()
+                        .find(|variable| variable.id == variable_id)
+                    else {
+                        bail!("environment variable `{key}` is not configured");
+                    };
+                    variable.sensitivity = VariableSensitivity::Sealed;
+                    variable.updated_at_unix_ms = now_unix_ms();
+                    repo.write_environment_variable(&variable)?;
+                    println!("Sealed {key}; sealed values cannot be unsealed or exported.");
+                }
+                EnvCommand::Export { environment } => {
+                    let environment = ensure_local_environment(&repo, &environment)?;
+                    let versions = repo.list_environment_variable_versions()?;
+                    for variable in repo
+                        .list_environment_variables()?
+                        .into_iter()
+                        .filter(|variable| variable.environment_id == environment.id)
+                    {
+                        if variable.sensitivity.is_write_only() {
+                            println!(
+                                "# {} is {:?} and requires ExportSecret policy on the registry",
+                                variable.key, variable.sensitivity
+                            );
+                            continue;
+                        }
+                        if let Some(value) = variable
+                            .current_version_id
+                            .as_ref()
+                            .and_then(|id| versions.iter().find(|version| &version.id == id))
+                            .and_then(|version| version.plaintext_value.as_ref())
+                        {
+                            println!("{}={}", variable.key, shell_escape_env_value(value));
+                        }
+                    }
+                }
+                EnvCommand::Diff => {
+                    println!(
+                        "Local env diff shows masked metadata only; staged registry diffs are enforced by Nebula policy."
+                    );
+                    for variable in repo.list_environment_variables()? {
+                        println!(
+                            "{}\t{}\t{:?}\t{:?}",
+                            variable.key,
+                            variable.scope.stable_key(),
+                            variable.availability,
+                            variable.sensitivity
+                        );
+                    }
                 }
             }
         }
@@ -1191,6 +1603,36 @@ fn run_command(command: Command, output: CliOutput) -> Result<()> {
                         tool, target, backup_id, !execute, operator,
                     ))?,
                 },
+                OpsCommand::Registry { command } => match command {
+                    OpsRegistryCommand::ImportFile {
+                        source,
+                        source_blob_store,
+                        dry_run,
+                        run_migrations,
+                    } => {
+                        let database_url = std::env::var("DATABASE_URL").context(
+                            "DATABASE_URL is required for registry import (Postgres metadata)",
+                        )?;
+                        let blob_store_url = std::env::var("BLOB_STORE_URL").context(
+                            "BLOB_STORE_URL is required for registry import (object store)",
+                        )?;
+                        let report = block_on_sync(async {
+                            nebula_registry::import_persisted_registry(
+                                nebula_registry::ImportFileOptions {
+                                    source_path: source,
+                                    database_url,
+                                    blob_store_url,
+                                    source_blob_store_path: source_blob_store,
+                                    dry_run,
+                                    run_migrations,
+                                },
+                            )
+                            .await
+                            .map_err(|error| anyhow::anyhow!(error))
+                        })?;
+                        serde_json::to_value(report)?
+                    }
+                },
             };
             emit_ops_report(&value, report_file.as_deref(), report_webhook.as_deref())?;
         }
@@ -1238,7 +1680,7 @@ fn cli_environment(snapshot: &nebula_core::TreeSnapshot, name: &str) -> Environm
         custom => EnvironmentKind::Custom(custom.to_string()),
     };
     Environment {
-        id: EnvironmentId::new(format!("env_local_{name}")),
+        id: EnvironmentId::new(format!("env_{name}")),
         repository_id: snapshot.repository_id.clone(),
         name: name.to_string(),
         kind,
@@ -1292,8 +1734,99 @@ fn parse_policy_action(raw: &str) -> Result<PolicyAction> {
         "read_build_source" => Ok(PolicyAction::ReadBuildSource),
         "create_projection" => Ok(PolicyAction::CreateProjection),
         "deploy" => Ok(PolicyAction::Deploy),
+        "manage_variables" => Ok(PolicyAction::ManageVariables),
+        "read_variable_metadata" => Ok(PolicyAction::ReadVariableMetadata),
+        "read_encrypted_variable" => Ok(PolicyAction::ReadEncryptedVariable),
+        "read_variable_value" => Ok(PolicyAction::ReadVariableValue),
+        "inject_variable" => Ok(PolicyAction::InjectVariable),
+        "reveal_variable" => Ok(PolicyAction::RevealVariable),
+        "save_secret" => Ok(PolicyAction::SaveSecret),
+        "push_secret" => Ok(PolicyAction::PushSecret),
+        "export_secret" => Ok(PolicyAction::ExportSecret),
+        "use_workspace_for_deploy" => Ok(PolicyAction::UseWorkspaceForDeploy),
+        "mutate_deploy_variables" => Ok(PolicyAction::MutateDeployVariables),
+        "manage_variable_policy" => Ok(PolicyAction::ManageVariablePolicy),
         _ => bail!("unknown policy action `{raw}`"),
     }
+}
+
+fn ensure_local_environment(repo: &LocalRepo, name: &str) -> Result<Environment> {
+    if let Some(environment) = repo
+        .list_environments()?
+        .into_iter()
+        .find(|environment| environment.name == name)
+    {
+        return Ok(environment);
+    }
+    repo.create_environment(name.to_string())
+}
+
+fn parse_variable_availability(raw: Vec<String>) -> Result<Vec<VariableAvailability>> {
+    if raw.is_empty() {
+        return Ok(vec![
+            VariableAvailability::Build,
+            VariableAvailability::Runtime,
+        ]);
+    }
+    raw.into_iter()
+        .map(|value| match value.as_str() {
+            "build" => Ok(VariableAvailability::Build),
+            "runtime" => Ok(VariableAvailability::Runtime),
+            "functions" => Ok(VariableAvailability::Functions),
+            "jobs" => Ok(VariableAvailability::Jobs),
+            "local" => Ok(VariableAvailability::Local),
+            other => bail!("unknown env variable scope `{other}`"),
+        })
+        .collect()
+}
+
+fn likely_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    key.ends_with("_SECRET")
+        || key.ends_with("_TOKEN")
+        || key.ends_with("_PRIVATE_KEY")
+        || key.contains("DATABASE_URL")
+        || key.contains("API_KEY")
+        || key.contains("PASSWORD")
+        || key.contains("CREDENTIAL")
+}
+
+fn local_fingerprint(key: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nebula-local-env-fingerprint");
+    hasher.update(key.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn masked_fingerprint(sensitivity: &VariableSensitivity, fingerprint: &str) -> String {
+    let suffix = fingerprint
+        .get(fingerprint.len().saturating_sub(8)..)
+        .unwrap_or(fingerprint);
+    match sensitivity {
+        VariableSensitivity::Public => "[public]".to_string(),
+        VariableSensitivity::Encrypted => format!("[encrypted] ...{suffix}"),
+        VariableSensitivity::Sensitive => format!("[sensitive] ...{suffix}"),
+        VariableSensitivity::Sealed => format!("[sealed] ...{suffix}"),
+    }
+}
+
+fn shell_escape_env_value(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn parse_lfs_strategy(raw: &str) -> Result<nebula_git::GitLfsStrategy> {
@@ -1338,6 +1871,9 @@ fn migration_bundle(
         proposals: Vec::new(),
         operations: Vec::new(),
         git_migration_records: migration.migration_records,
+        environment_variables: Vec::new(),
+        environment_variable_versions: Vec::new(),
+        environments: Vec::new(),
         blobs: migration
             .blobs
             .into_iter()
@@ -1353,11 +1889,25 @@ fn open_repo() -> Result<LocalRepo> {
     LocalRepo::open(std::env::current_dir()?)
 }
 
+fn remote_full_url(repo: &LocalRepo, remote_name: Option<String>) -> Option<String> {
+    if let Some(remote) = &remote_name
+        && is_registry_remote(remote)
+    {
+        return Some(remote.clone());
+    }
+    let name = remote_name.unwrap_or_else(|| "origin".to_string());
+    repo.list_remotes()
+        .ok()?
+        .into_iter()
+        .find(|r| r.name == name)
+        .map(|r| r.url)
+}
+
 fn remote_registry_url(repo: &LocalRepo, remote_name: Option<String>) -> Result<Option<String>> {
-    if let Some(remote) = &remote_name {
-        if is_registry_remote(remote) {
-            return Ok(Some(registry_base_url(remote)));
-        }
+    if let Some(remote) = &remote_name
+        && is_registry_remote(remote)
+    {
+        return Ok(Some(registry_base_url(remote)));
     }
     let name = remote_name.unwrap_or_else(|| "origin".to_string());
     let remote = repo
@@ -1385,14 +1935,15 @@ struct ParsedRegistryRemote {
 }
 
 fn parse_registry_clone_remote(remote: &str) -> Option<ParsedRegistryRemote> {
-    if let Some((url, repository_id)) = remote.split_once('#') {
-        if is_registry_remote(url) && !repository_id.trim().is_empty() {
-            return Some(ParsedRegistryRemote {
-                registry_url: registry_base_url(url),
-                repository_id: nebula_core::RepositoryId::new(repository_id),
-                remote_url: remote.to_string(),
-            });
-        }
+    if let Some((url, repository_id)) = remote.split_once('#')
+        && is_registry_remote(url)
+        && !repository_id.trim().is_empty()
+    {
+        return Some(ParsedRegistryRemote {
+            registry_url: registry_base_url(url),
+            repository_id: nebula_core::RepositoryId::new(repository_id),
+            remote_url: remote.to_string(),
+        });
     }
 
     if let Some(parsed) = parse_neb_remote_url(remote) {
@@ -1687,6 +2238,78 @@ fn handle_auth_command(command: AuthCommand, output: CliOutput) -> Result<()> {
             }
         }
         AuthCommand::Token { command } => handle_auth_token_command(command, output)?,
+        AuthCommand::Whoami {
+            registry_url,
+            remote,
+        } => {
+            let registry_url = resolve_auth_registry_url(registry_url, Some(remote))?;
+            let token = auth_token_for_registry(&registry_url)?;
+            let response: serde_json::Value = block_on_sync(async {
+                let resp = reqwest::Client::new()
+                    .get(format!("{}/v1/whoami", registry_url))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .context("failed to reach registry")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("registry returned {status}: {body}");
+                }
+                resp.json()
+                    .await
+                    .context("failed to decode whoami response")
+            })?;
+            if output.json {
+                print_json(response)?;
+            } else {
+                let actor = response
+                    .get("actor")
+                    .map(format_actor_json)
+                    .unwrap_or_default();
+                let org_id = response
+                    .get("org_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let repository_id = response
+                    .get("repository_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unbound - any repo you're authorized for)");
+                let scopes = response
+                    .get("scopes")
+                    .and_then(|v| v.as_array())
+                    .map(|scopes| {
+                        scopes
+                            .iter()
+                            .filter_map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let bypasses = response
+                    .get("bypasses_policy_checks")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let token_id = response
+                    .get("token_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                println!("actor:       {actor}");
+                println!("token_id:    {token_id}");
+                println!("org:         {org_id}");
+                println!("repository:  {repository_id}");
+                println!("scopes:      {scopes}");
+                if bypasses {
+                    println!(
+                        "note:        this identity bypasses per-repository policy checks (ManageAuth)"
+                    );
+                } else {
+                    println!(
+                        "note:        use the actor value above with `neb galaxy policy grant` to authorize this identity for an action; add --token {token_id} to that command to scope the grant to just this token instead of the whole account"
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1982,6 +2605,468 @@ fn handle_galaxy_command(command: GalaxyCommand, output: CliOutput) -> Result<()
                 println!("  neb push origin");
             }
         }
+        GalaxyCommand::DeployConfig { command } => handle_deploy_config_command(command, output)?,
+        GalaxyCommand::Policy { command } => handle_galaxy_policy_command(command, output)?,
+        GalaxyCommand::List {
+            org,
+            registry_url,
+            remote,
+        } => {
+            let registry_url =
+                resolve_auth_registry_url(Some(registry_url).flatten(), Some(remote))?;
+            let token = auth_token_for_registry(&registry_url)?;
+            let response: serde_json::Value = block_on_sync(async {
+                let mut req = reqwest::Client::new()
+                    .get(format!("{}/v1/galaxies", registry_url))
+                    .bearer_auth(&token);
+                if let Some(org) = &org {
+                    req = req.query(&[("org_id", org)]);
+                }
+                let resp = req.send().await.context("failed to reach registry")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("registry returned {status}: {body}");
+                }
+                resp.json()
+                    .await
+                    .context("failed to decode galaxy list response")
+            })?;
+            if output.json {
+                print_json(response)?;
+            } else {
+                let galaxies = response.as_array().cloned().unwrap_or_default();
+                if galaxies.is_empty() {
+                    println!("No galaxies found.");
+                }
+                for galaxy in galaxies {
+                    let id = galaxy.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let name = galaxy.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let org_id = galaxy.get("org_id").and_then(|v| v.as_str()).unwrap_or("-");
+                    println!("{id}\torg={org_id}\t{name}");
+                }
+            }
+        }
+        GalaxyCommand::Get {
+            galaxy,
+            registry_url,
+            remote,
+        } => {
+            let registry_url =
+                resolve_auth_registry_url(Some(registry_url).flatten(), Some(remote))?;
+            let token = auth_token_for_registry(&registry_url)?;
+            let response: serde_json::Value = block_on_sync(async {
+                let galaxy_id = resolve_galaxy_id_async(&registry_url, &token, &galaxy).await?;
+                let resp = reqwest::Client::new()
+                    .get(format!("{}/v1/galaxies/{}", registry_url, galaxy_id))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .context("failed to reach registry")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("registry returned {status}: {body}");
+                }
+                resp.json()
+                    .await
+                    .context("failed to decode galaxy response")
+            })?;
+            print_json(response)?;
+        }
+    }
+    Ok(())
+}
+
+/// Converts a CLI action string ("manage_deploy_config", optionally prefixed
+/// with "nebula.repository:") into the PascalCase form `PolicyAction` uses on
+/// the wire (e.g. "ManageDeployConfig").
+fn policy_action_json(action: &str) -> String {
+    let stripped = action.strip_prefix("nebula.repository:").unwrap_or(action);
+    stripped
+        .split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<String>()
+}
+
+/// Parses a CLI actor spec ("public" or "<kind>:<id>") into the JSON shape
+/// the registry's externally-tagged `Actor` enum expects.
+fn parse_actor_json(actor: &str) -> Result<serde_json::Value> {
+    if actor.eq_ignore_ascii_case("public") {
+        return Ok(json!("Public"));
+    }
+    let (kind, id) = actor.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "actor must be \"public\" or \"<kind>:<id>\" (kind: user, team, agent, integration)"
+        )
+    })?;
+    let key = match kind.to_ascii_lowercase().as_str() {
+        "user" => "User",
+        "team" => "Team",
+        "agent" => "Agent",
+        "integration" => "Integration",
+        other => bail!("unknown actor kind '{other}'; expected user, team, agent, or integration"),
+    };
+    Ok(json!({ key: id }))
+}
+
+/// The inverse of `parse_actor_json`: formats the registry's wire-format
+/// `Actor` JSON back into the CLI's "<kind>:<id>" spec, so a printed actor
+/// (e.g. from `neb auth whoami` or `neb galaxy policy list`) can be pasted
+/// directly into `neb galaxy policy grant`.
+fn format_actor_json(actor: &serde_json::Value) -> String {
+    if let Some(s) = actor.as_str() {
+        return s.to_ascii_lowercase();
+    }
+    if let Some(obj) = actor.as_object()
+        && let Some((kind, value)) = obj.iter().next()
+        && let Some(id) = value.as_str()
+    {
+        return format!("{}:{}", kind.to_ascii_lowercase(), id);
+    }
+    actor.to_string()
+}
+
+fn handle_galaxy_policy_command(command: GalaxyPolicyCommand, output: CliOutput) -> Result<()> {
+    match command {
+        GalaxyPolicyCommand::Grant {
+            galaxy,
+            actor,
+            actions,
+            priority,
+            reason,
+            token_id: grant_token_id,
+            registry_url,
+            remote,
+        } => {
+            let actor_json = parse_actor_json(&actor)?;
+            let action_values = actions
+                .iter()
+                .map(|action| policy_action_json(action))
+                .collect::<Vec<_>>();
+            let registry_url =
+                resolve_auth_registry_url(Some(registry_url).flatten(), Some(remote))?;
+            let token = auth_token_for_registry(&registry_url)?;
+            let policy_id = nebula_core::PolicyId::generated();
+            let policy_name = format!("grant-{actor}-{}", actions.join("-"));
+            let response: serde_json::Value = block_on_sync(async {
+                let galaxy_id = resolve_galaxy_id_async(&registry_url, &token, &galaxy).await?;
+                let body = json!({
+                    "id": policy_id.as_str(),
+                    "repository_id": galaxy_id,
+                    "name": policy_name,
+                    "priority": priority,
+                    "rules": [{
+                        "actor": actor_json,
+                        "token_id": grant_token_id,
+                        "environment_id": null,
+                        "environment_kind": null,
+                        "path_glob": null,
+                        "key_glob": null,
+                        "service_id": null,
+                        "workspace_id": null,
+                        "sensitivity": null,
+                        "availability": null,
+                        "actions": action_values,
+                        "decision": "Allow",
+                        "reason": reason,
+                    }],
+                });
+                let resp = reqwest::Client::new()
+                    .put(format!(
+                        "{}/v1/galaxies/{}/policies",
+                        registry_url, galaxy_id
+                    ))
+                    .bearer_auth(&token)
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("failed to reach registry")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("registry returned {status}: {body}");
+                }
+                resp.json()
+                    .await
+                    .context("failed to decode policy response")
+            })?;
+            if output.json {
+                print_json(response)?;
+            } else {
+                match &grant_token_id {
+                    Some(token_id) => println!(
+                        "Granted {} to {} (token {token_id} only) on {} (policy {})",
+                        actions.join(", "),
+                        actor,
+                        galaxy,
+                        policy_id.as_str()
+                    ),
+                    None => println!(
+                        "Granted {} to {} on {} (policy {})",
+                        actions.join(", "),
+                        actor,
+                        galaxy,
+                        policy_id.as_str()
+                    ),
+                }
+            }
+        }
+        GalaxyPolicyCommand::List {
+            galaxy,
+            registry_url,
+            remote,
+        } => {
+            let registry_url =
+                resolve_auth_registry_url(Some(registry_url).flatten(), Some(remote))?;
+            let token = auth_token_for_registry(&registry_url)?;
+            let response: serde_json::Value = block_on_sync(async {
+                let galaxy_id = resolve_galaxy_id_async(&registry_url, &token, &galaxy).await?;
+                let resp = reqwest::Client::new()
+                    .get(format!(
+                        "{}/v1/galaxies/{}/policies",
+                        registry_url, galaxy_id
+                    ))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .context("failed to reach registry")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("registry returned {status}: {body}");
+                }
+                resp.json()
+                    .await
+                    .context("failed to decode policy list response")
+            })?;
+            if output.json {
+                print_json(response)?;
+            } else {
+                let policies = response.as_array().cloned().unwrap_or_default();
+                if policies.is_empty() {
+                    println!("No policies granted on {galaxy}.");
+                }
+                for policy in policies {
+                    let id = policy.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let name = policy.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let priority = policy.get("priority").and_then(|v| v.as_i64()).unwrap_or(0);
+                    println!("{id}\tpriority={priority}\t{name}");
+                    for rule in policy
+                        .get("rules")
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten()
+                    {
+                        let actor = rule.get("actor").map(format_actor_json).unwrap_or_default();
+                        let actions = rule
+                            .get("actions")
+                            .and_then(|v| v.as_array())
+                            .map(|actions| {
+                                actions
+                                    .iter()
+                                    .filter_map(|a| a.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        let decision = rule.get("decision").cloned().unwrap_or_default();
+                        let token_suffix = rule
+                            .get("token_id")
+                            .and_then(|v| v.as_str())
+                            .map(|token_id| format!("\ttoken={token_id}"))
+                            .unwrap_or_default();
+                        println!(
+                            "    actor={actor}\tdecision={decision}\tactions=[{actions}]{token_suffix}"
+                        );
+                    }
+                }
+            }
+        }
+        GalaxyPolicyCommand::Revoke {
+            galaxy,
+            policy_id,
+            registry_url,
+            remote,
+        } => {
+            let registry_url =
+                resolve_auth_registry_url(Some(registry_url).flatten(), Some(remote))?;
+            let token = auth_token_for_registry(&registry_url)?;
+            block_on_sync(async {
+                let galaxy_id = resolve_galaxy_id_async(&registry_url, &token, &galaxy).await?;
+                let resp = reqwest::Client::new()
+                    .delete(format!(
+                        "{}/v1/galaxies/{}/policies/{}",
+                        registry_url, galaxy_id, policy_id
+                    ))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .context("failed to reach registry")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("registry returned {status}: {body}");
+                }
+                Ok(())
+            })?;
+            if output.json {
+                print_json(json!({ "ok": true, "policy_id": policy_id }))?;
+            } else {
+                println!("Revoked policy {policy_id} on {galaxy}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves `galaxy` to a `repo_...` id, looking it up by `owner/name` against
+/// the registry if it isn't already an id. Must run inside the same
+/// single-threaded runtime as the rest of the command (nested `block_on_sync`
+/// calls would deadlock), so callers await this directly.
+async fn resolve_galaxy_id_async(
+    registry_url: &str,
+    token: &str,
+    galaxy: &str,
+) -> anyhow::Result<String> {
+    if galaxy.starts_with("repo_") {
+        return Ok(galaxy.to_string());
+    }
+    let (owner, name) = galaxy
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("galaxy must be a repo_... id or owner/name"))?;
+    let id = resolve_named_galaxy(registry_url, owner, name, Some(token)).await?;
+    Ok(id.as_str().to_string())
+}
+
+fn handle_deploy_config_command(command: DeployConfigCommand, output: CliOutput) -> Result<()> {
+    match command {
+        DeployConfigCommand::Set {
+            galaxy,
+            service_id,
+            deploy_url,
+            signing_secret,
+            provider_key,
+            environment_id,
+            environment_name,
+            context_path,
+            auto_deploy,
+            registry_url,
+            remote,
+        } => {
+            if signing_secret.len() < 16 {
+                bail!("signing_secret must be at least 16 characters");
+            }
+            let registry_url =
+                resolve_auth_registry_url(Some(registry_url).flatten(), Some(remote))?;
+            let token = auth_token_for_registry(&registry_url)?;
+            let body = json!({
+                "provider_key": provider_key,
+                "deploy_url": deploy_url,
+                "signing_secret": signing_secret,
+                "service_id": service_id,
+                "environment_id": environment_id,
+                "environment_name": environment_name,
+                "context_path": context_path,
+                "auto_deploy": auto_deploy,
+            });
+            let response: serde_json::Value = block_on_sync(async {
+                let galaxy_id = resolve_galaxy_id_async(&registry_url, &token, &galaxy).await?;
+                let resp = reqwest::Client::new()
+                    .put(format!(
+                        "{}/v1/galaxies/{}/deploy-configs/{}",
+                        registry_url, galaxy_id, service_id
+                    ))
+                    .bearer_auth(&token)
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("failed to reach registry")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("registry returned {status}: {body}");
+                }
+                resp.json()
+                    .await
+                    .context("failed to decode deploy config response")
+            })?;
+            if output.json {
+                print_json(response)?;
+            } else {
+                println!("Set deploy config for {galaxy}/{service_id} on {registry_url}");
+            }
+        }
+        DeployConfigCommand::Get {
+            galaxy,
+            service_id,
+            registry_url,
+            remote,
+        } => {
+            let registry_url =
+                resolve_auth_registry_url(Some(registry_url).flatten(), Some(remote))?;
+            let token = auth_token_for_registry(&registry_url)?;
+            let response: serde_json::Value = block_on_sync(async {
+                let galaxy_id = resolve_galaxy_id_async(&registry_url, &token, &galaxy).await?;
+                let resp = reqwest::Client::new()
+                    .get(format!(
+                        "{}/v1/galaxies/{}/deploy-configs/{}",
+                        registry_url, galaxy_id, service_id
+                    ))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .context("failed to reach registry")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("registry returned {status}: {body}");
+                }
+                resp.json()
+                    .await
+                    .context("failed to decode deploy config response")
+            })?;
+            print_json(response)?;
+        }
+        DeployConfigCommand::Delete {
+            galaxy,
+            service_id,
+            registry_url,
+            remote,
+        } => {
+            let registry_url =
+                resolve_auth_registry_url(Some(registry_url).flatten(), Some(remote))?;
+            let token = auth_token_for_registry(&registry_url)?;
+            block_on_sync(async {
+                let galaxy_id = resolve_galaxy_id_async(&registry_url, &token, &galaxy).await?;
+                let resp = reqwest::Client::new()
+                    .delete(format!(
+                        "{}/v1/galaxies/{}/deploy-configs/{}",
+                        registry_url, galaxy_id, service_id
+                    ))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .context("failed to reach registry")?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    bail!("registry returned {status}: {body}");
+                }
+                Ok(())
+            })?;
+            if output.json {
+                print_json(json!({ "ok": true, "galaxy": galaxy, "service_id": service_id }))?;
+            } else {
+                println!("Deleted deploy config for {galaxy}/{service_id}");
+            }
+        }
     }
     Ok(())
 }
@@ -2066,6 +3151,60 @@ fn finish_progress(progress: Option<ProgressBar>, message: &'static str) {
 
 fn repo_path_hint(_repo: &LocalRepo) -> String {
     ".nebula".to_string()
+}
+
+fn truncate_path(path: &std::path::Path, max_len: usize) -> String {
+    let s = path.to_string_lossy();
+    if let Ok(home) = std::env::var("HOME")
+        && s.starts_with(&home)
+    {
+        let rel = &s[home.len()..];
+        let short = format!("~{rel}");
+        if short.len() <= max_len {
+            return short;
+        }
+        return format!("…{}", &short[short.len().saturating_sub(max_len)..]);
+    }
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+    format!("…{}", &s[s.len().saturating_sub(max_len)..])
+}
+
+fn print_repo_header(output: &CliOutput, repo: &LocalRepo, change_count: usize) {
+    if output.json || output.quiet {
+        return;
+    }
+
+    let version = env!("CARGO_PKG_VERSION");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| repo.root().to_path_buf());
+    let path = truncate_path(&cwd, 42);
+    let ref_name = repo
+        .config()
+        .ok()
+        .map(|c| c.default_ref)
+        .unwrap_or_else(|| "main".to_string());
+
+    if output.no_color {
+        println!("◆ v{version}  {path}  ⎇ {ref_name}  ± {change_count}");
+        println!();
+        return;
+    }
+
+    // 256-color ANSI: dark charcoal background, muted silver text
+    let bg = "\x1b[48;5;235m";
+    let fg = "\x1b[38;5;250m";
+    let fg_accent = "\x1b[38;5;255m\x1b[1m";
+    let reset = "\x1b[0m";
+    let sep = format!("{reset}\x1b[38;5;240m  {reset}");
+
+    let v_pill = format!("{bg}{fg} ◆ {fg_accent}v{version}{fg} {reset}");
+    let p_pill = format!("{bg}{fg} {path} {reset}");
+    let r_pill = format!("{bg}{fg} ⎇  {fg_accent}{ref_name}{fg} {reset}");
+    let c_pill = format!("{bg}{fg} ± {fg_accent}{change_count}{fg} {reset}");
+
+    println!("{v_pill}{sep}{p_pill}{sep}{r_pill}{sep}{c_pill}");
+    println!();
 }
 
 fn print_diff_summary(diff: &nebula_core::TreeDiff) {

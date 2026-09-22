@@ -155,6 +155,39 @@ pub trait RegistryStore: Send + Sync {
         kind: &str,
         id: &str,
     ) -> NebulaResult<()>;
+    /// Batched variant of `get_resource_scoped`: looks up every id in one round trip
+    /// and returns (id, value) pairs for the ones found (order is not guaranteed).
+    /// Backends without a native batch query can fall back to looping, but
+    /// implementors backed by a database should override this to avoid one round
+    /// trip per id.
+    async fn get_resources_scoped_batch(
+        &self,
+        repository_id: Option<&RepositoryId>,
+        kind: &str,
+        ids: &[String],
+    ) -> NebulaResult<Vec<(String, serde_json::Value)>> {
+        let mut values = Vec::new();
+        for id in ids {
+            match self.get_resource_scoped(repository_id, kind, id).await {
+                Ok(value) => values.push((id.clone(), value)),
+                Err(NebulaError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(values)
+    }
+    /// Batched variant of `delete_resource`: deletes every id in one round trip.
+    async fn delete_resources_batch(
+        &self,
+        repository_id: Option<&RepositoryId>,
+        kind: &str,
+        ids: &[String],
+    ) -> NebulaResult<()> {
+        for id in ids {
+            self.delete_resource(repository_id, kind, id).await?;
+        }
+        Ok(())
+    }
     async fn put_resource_idempotent(
         &self,
         repository_id: Option<&RepositoryId>,

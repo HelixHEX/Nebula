@@ -1,0 +1,36 @@
+# Rust build output - rebuilt inside Docker via cargo-chef cache mounts
+# See Dockerfile.registry-server - host target is 28G Mach-O and not used
+/target/
+target/
+
+# Git and Nebula local state
+.git
+.gitignore
+.nebula/
+*.nebula.json
+
+# Secrets and local env - never bake into image
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# Local scratch data
+*.db
+*.sqlite
+*.sqlite3
+/data/
+/tmp/
+/scratch/
+coverage/
+lcov.info
+*.profraw
+*.profdata
+tests/load/results/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

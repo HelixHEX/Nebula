@@ -188,10 +188,9 @@ impl JwksVerifier {
             .read()
             .map_err(|_| AuthError::JwksFetch("jwks cache poisoned".to_string()))?
             .clone()
+            && cached.fetched_at.elapsed() <= self.cache_ttl
         {
-            if cached.fetched_at.elapsed() <= self.cache_ttl {
-                return Ok(cached.jwks);
-            }
+            return Ok(cached.jwks);
         }
         self.refresh_jwks().await
     }
@@ -295,11 +294,36 @@ fn scope_to_action(scope: &str) -> Option<PolicyAction> {
         "nebula:git_export" | "export:git" => Some(PolicyAction::ExportGit),
         "nebula:deploy" | "deploy" => Some(PolicyAction::Deploy),
         "nebula:manage_auth" | "manage:auth" => Some(PolicyAction::ManageAuth),
+        "nebula:manage_deploy_config" | "manage:deploy_config" => {
+            Some(PolicyAction::ManageDeployConfig)
+        }
         "nebula:manage_webhooks" | "manage:webhooks" => Some(PolicyAction::ManageWebhooks),
         "nebula:sync" | "sync:objects" => Some(PolicyAction::SyncObjects),
         "nebula:review" | "review:proposal" => Some(PolicyAction::ReviewProposal),
         "nebula:checks" | "run:status_check" => Some(PolicyAction::RunStatusCheck),
         "nebula:index" | "index:code" => Some(PolicyAction::IndexCode),
+        "nebula:manage_variables" | "env:manage" => Some(PolicyAction::ManageVariables),
+        "nebula:read_variable_metadata" | "env:metadata" => {
+            Some(PolicyAction::ReadVariableMetadata)
+        }
+        "nebula:read_encrypted_variable" | "env:read_encrypted" => {
+            Some(PolicyAction::ReadEncryptedVariable)
+        }
+        "nebula:read_variable_value" | "env:read_value" => Some(PolicyAction::ReadVariableValue),
+        "nebula:inject_variable" | "env:inject" => Some(PolicyAction::InjectVariable),
+        "nebula:reveal_variable" | "env:reveal" => Some(PolicyAction::RevealVariable),
+        "nebula:save_secret" | "env:save_secret" => Some(PolicyAction::SaveSecret),
+        "nebula:push_secret" | "env:push_secret" => Some(PolicyAction::PushSecret),
+        "nebula:export_secret" | "env:export_secret" => Some(PolicyAction::ExportSecret),
+        "nebula:use_workspace_for_deploy" | "deploy:workspace" => {
+            Some(PolicyAction::UseWorkspaceForDeploy)
+        }
+        "nebula:mutate_deploy_variables" | "deploy:mutate_env" => {
+            Some(PolicyAction::MutateDeployVariables)
+        }
+        "nebula:manage_variable_policy" | "env:manage_policy" => {
+            Some(PolicyAction::ManageVariablePolicy)
+        }
         _ => None,
     }
 }

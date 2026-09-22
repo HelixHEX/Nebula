@@ -30,7 +30,7 @@ Manual webhook secret setup:
 
 Managed provider setup:
 
-- Vercel, Nebula Cloud, and Lucity Cloud setup should call the same endpoint API and configure the returned header/secret automatically when concrete providers are implemented.
+- Vercel, Nebula Cloud, and Horizon Cloud setup should call the same endpoint API and configure the returned header/secret automatically when concrete providers are implemented.
 - Provider execution is intentionally not implemented in this sprint. The receiver creates `DeploymentIntent` and `DeploymentIntegrationDispatch` records with `pending_provider_integration`.
 
 Retry semantics:
@@ -61,11 +61,10 @@ Shared environment:
 - `NEBULA_TELEMETRY_WEBHOOK_SECRET`: shared signing secret for telemetry events and ops reports.
 - `NEBULA_OPS_REPORT_WEBHOOK`: validation-script target for `neb ops` reports.
 
-Lucity adapter:
+Astracollab Cloud integration:
 
-- Lucity is configured only in Astracollab Cloud, not in self-hosted Nebula.
-- `LUCITY_GRAPHQL_URL` and `LUCITY_API_TOKEN` enable Astracollab to dispatch Lucity deployments.
-- Astracollab maps Nebula scheduled ops to Lucity CronJobs for hosted deployments:
+- Astracollab Cloud is configured only in hosted deployments, not in self-hosted Nebula.
+- Astracollab Cloud maps Nebula scheduled ops to Horizon CronJobs for hosted deployments:
   - `neb ops consistency check --report-webhook $ASTRACOLLAB_NEBULA_OPS_WEBHOOK_URL`
   - `neb ops retention cleanup --report-webhook $ASTRACOLLAB_NEBULA_OPS_WEBHOOK_URL`
 
@@ -133,7 +132,7 @@ BLOB_STORE_URL=s3://... \
 ./tests/production/validate-production.sh
 ```
 
-This validates the hosted path without coupling self-hosted Nebula to Lucity: Nebula emits the report, Astracollab receives and persists it, and Lucity remains only the optional runtime/CronJob executor.
+This validates the hosted path without coupling self-hosted Nebula to Horizon: Nebula emits the report, Astracollab receives and persists it, and Horizon remains only the optional runtime/CronJob executor.
 
 Restore drill:
 

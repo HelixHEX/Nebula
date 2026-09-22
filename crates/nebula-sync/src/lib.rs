@@ -187,20 +187,166 @@ pub struct RegistrySyncClient {
 
 impl RegistrySyncClient {
     pub fn new(base_url: impl Into<String>, bearer_token: Option<String>) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        let client = Self::build_sync_client();
         Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url,
             bearer_token,
-            client: reqwest::Client::new(),
+            client,
         }
     }
 
-    pub async fn push_repo(&self, repo: &LocalRepo) -> Result<LocalSyncBundle> {
-        let bundle = repo.export_bundle_metadata()?;
+    fn build_sync_client() -> reqwest::Client {
+        let connect_timeout_secs = Self::numeric_env("NEBULA_SYNC_CONNECT_TIMEOUT", 30);
+        let pool_idle_timeout_secs = Self::numeric_env("NEBULA_SYNC_POOL_IDLE_TIMEOUT", 60);
+        let tcp_keepalive_secs = Self::numeric_env("NEBULA_SYNC_TCP_KEEPALIVE", 30);
+        let pool_max_idle_per_host = Self::numeric_env("NEBULA_SYNC_POOL_MAX_IDLE_PER_HOST", 16) as usize;
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+            .pool_idle_timeout(std::time::Duration::from_secs(pool_idle_timeout_secs))
+            .tcp_keepalive(std::time::Duration::from_secs(tcp_keepalive_secs))
+            .pool_max_idle_per_host(Self::numeric_env("NEBULA_SYNC_POOL_MAX_IDLE_PER_HOST", 16) as usize);
+        if let Ok(user_agent) = std::env::var("NEBULA_USER_AGENT") {
+            if !user_agent.is_empty() {
+                builder = builder.user_agent(user_agent);
+            }
+        }
+        builder.build().expect("invalid reqwest client configuration")
+    }
+
+    const DEFAULT_PUSH_MAX_RETRIES: u32 = 5;
+    const DEFAULT_RETRY_BASE_DELAY_MS: u64 = 250;
+    const MAXIMUM_RETRY_DELAY_MS: u64 = 15_000;
+    const RETRY_JITTER_MS: u64 = 250;
+
+    fn numeric_env(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+
+    fn push_max_retries() -> u32 {
+        std::env::var("NEBULA_PUSH_MAX_RETRIES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(Self::DEFAULT_PUSH_MAX_RETRIES)
+    }
+
+    fn is_transient_error(error: &anyhow::Error) -> bool {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error.as_ref());
+        while let Some(err) = source {
+            if let Some(reqwest_error) = err.downcast_ref::<reqwest::Error>() {
+                if reqwest_error.is_connect() || reqwest_error.is_timeout() || reqwest_error.is_body() {
+                    return true;
+                }
+            }
+            source = err.source();
+        }
+        let text = format!("{error:?}").to_ascii_lowercase();
+        text.contains("connection reset")
+            || text.contains("broken pipe")
+            || text.contains("connect error")
+            || text.contains("timed out")
+            || text.contains("operation timed out")
+            || text.contains("connection refused")
+            || text.contains("connection closed")
+            || text.contains("eof")
+            || text.contains("empty reply")
+            || text.contains("registry request failed with 408")
+            || text.contains("registry request failed with 429")
+            || text.contains("registry request failed with 502")
+            || text.contains("registry request failed with 503")
+            || text.contains("registry request failed with 504")
+            || text.contains("registry request failed with 524")
+    }
+
+    async fn retry_transient<T, F, Fut>(mut make_attempt: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let max_retries = Self::push_max_retries();
+        let base_delay_ms = Self::numeric_env("NEBULA_PUSH_RETRY_BACKOFF_MS", Self::DEFAULT_RETRY_BASE_DELAY_MS);
+        let mut attempt: u32 = 0;
+        let mut last_error: Option<anyhow::Error> = None;
+        loop {
+            match make_attempt().await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt >= max_retries {
+                        break;
+                    }
+                    if !Self::is_transient_error(last_error.as_ref().unwrap()) {
+                        break;
+                    }
+                    attempt += 1;
+                    let mut delay_ms = base_delay_ms.saturating_mul((1u64 << attempt).saturating_sub(1));
+                    if delay_ms > Self::MAXIMUM_RETRY_DELAY_MS {
+                        delay_ms = Self::MAXIMUM_RETRY_DELAY_MS;
+                    }
+                    let jitter_nanos = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.subsec_nanos() % (Self::RETRY_JITTER_MS as u32 * 1_000_000))
+                        .unwrap_or(0)) as u64;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms) + std::time::Duration::from_nanos(jitter_nanos)).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("retry exhausted without an error")))
+    }
+
+    pub async fn push_repo(
+        &self,
+        repo: &LocalRepo,
+        repository_id_override: Option<RepositoryId>,
+    ) -> Result<LocalSyncBundle> {
+        let mut bundle = repo.export_bundle_metadata()?;
+        if let Some(id) = repository_id_override {
+            bundle.repository_id = id.clone();
+            for reference in &mut bundle.refs {
+                reference.repository_id = id.clone();
+            }
+            for snapshot in &mut bundle.snapshots {
+                snapshot.repository_id = id.clone();
+            }
+            for changeset in &mut bundle.changesets {
+                changeset.repository_id = id.clone();
+            }
+            for proposal in &mut bundle.proposals {
+                proposal.repository_id = id.clone();
+            }
+            for operation in &mut bundle.operations {
+                operation.repository_id = id.clone();
+            }
+            for record in &mut bundle.git_migration_records {
+                record.repository_id = id.clone();
+            }
+            for variable in &mut bundle.environment_variables {
+                variable.repository_id = id.clone();
+            }
+            for version in &mut bundle.environment_variable_versions {
+                version.repository_id = id.clone();
+            }
+        }
         let refs = bundle.refs.clone();
         let mut bundle_without_refs = bundle.clone();
         bundle_without_refs.refs = Vec::new();
-        let session = self
-            .start_session(
+        let debug_timing = std::env::var("NEBULA_DEBUG_PUSH_TIMING").is_ok();
+        macro_rules! timed {
+            ($label:expr, $body:expr) => {{
+                let started = std::time::Instant::now();
+                let result = $body;
+                if debug_timing {
+                    eprintln!("[push-timing] {} took {:?}", $label, started.elapsed());
+                }
+                result
+            }};
+        }
+        let session = Self::retry_transient(|| async {
+            self.start_session(
                 &bundle.repository_id,
                 &StartSyncSessionRequest {
                     direction: SyncDirection::Push,
@@ -209,7 +355,9 @@ impl RegistrySyncClient {
                     actor: Actor::Public,
                 },
             )
-            .await?;
+            .await
+        })
+        .await?;
         let chunk_descriptors = bundle
             .blobs
             .iter()
@@ -229,38 +377,84 @@ impl RegistrySyncClient {
             total_bytes: chunk_descriptors.iter().map(|chunk| chunk.size_bytes).sum(),
             chunks: chunk_descriptors,
         };
-        self.put_chunk_manifest(&bundle.repository_id, &session.id, &manifest)
-            .await?;
+        timed!(
+            "put_chunk_manifest",
+            Self::retry_transient(|| async {
+                self.put_chunk_manifest(&bundle.repository_id, &session.id, &manifest)
+                    .await
+            })
+            .await
+        )?;
         let blobs = bundle
             .blobs
             .iter()
             .map(|record| record.blob.clone())
             .collect::<Vec<_>>();
-        if let Some(plan) = self
-            .plan_blob_uploads(&bundle.repository_id, &session.id, blobs.clone())
-            .await?
-        {
-            self.upload_planned_blobs(&bundle.repository_id, &session.id, repo, plan.uploads)
-                .await?;
+        if let Some(plan) = timed!(
+            "plan_blob_uploads",
+            Self::retry_transient(|| async {
+                self.plan_blob_uploads(&bundle.repository_id, &session.id, blobs.clone())
+                    .await
+            })
+            .await
+        )? {
+            let uploads = plan.uploads;
+            timed!(
+                "upload_planned_blobs",
+                Self::retry_transient(|| async {
+                    self.upload_planned_blobs(&bundle.repository_id, &session.id, repo, uploads.clone())
+                        .await
+                })
+                .await
+            )?;
         } else {
-            self.upload_legacy_missing_blobs(&bundle.repository_id, &session.id, repo, &bundle)
-                .await?;
+            timed!(
+                "upload_legacy_missing_blobs",
+                Self::retry_transient(|| async {
+                    self.upload_legacy_missing_blobs(&bundle.repository_id, &session.id, repo, &bundle)
+                        .await
+                })
+                .await
+            )?;
         }
-        self.put_session_bundle(&bundle.repository_id, &session.id, &bundle_without_refs)
-            .await?;
-        let validation = self
-            .validate_session(&bundle.repository_id, &session.id)
-            .await?;
+        timed!(
+            "put_session_bundle",
+            Self::retry_transient(|| async {
+                self.put_session_bundle(&bundle.repository_id, &session.id, &bundle_without_refs)
+                    .await
+            })
+            .await
+        )?;
+        let validation = timed!(
+            "validate_session",
+            Self::retry_transient(|| async {
+                self.validate_session(&bundle.repository_id, &session.id)
+                    .await
+            })
+            .await
+        )?;
         if !validation.valid {
             anyhow::bail!(
                 "sync validation failed; missing {} chunk(s)",
                 validation.missing_chunks.len()
             );
         }
-        self.commit_session(&bundle.repository_id, &session.id)
-            .await?;
+        timed!(
+            "commit_session",
+            Self::retry_transient(|| async {
+                self.commit_session(&bundle.repository_id, &session.id)
+                    .await
+            })
+            .await
+        )?;
         for reference in &refs {
-            self.upsert_ref(&bundle.repository_id, reference).await?;
+            timed!(
+                "upsert_ref",
+                Self::retry_transient(|| async {
+                    self.upsert_ref(&bundle.repository_id, reference).await
+                })
+                .await
+            )?;
         }
         Ok(bundle)
     }

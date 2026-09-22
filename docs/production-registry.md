@@ -31,6 +31,28 @@ Optional but common:
 - `NEBULA_TELEMETRY_WEBHOOK_SECRET`
 - `NEBULA_ADMIN_WEBHOOK_SECRET`
 
+## Building The Registry Image
+
+`Dockerfile.registry-server` uses `cargo-chef` with BuildKit cache mounts on
+`~/.cargo/registry` and `target/` to split "compile dependencies" from
+"compile our crates" into separate layers keyed on `Cargo.lock`. A source-only
+change (no dependency bump) should rebuild in a couple of minutes instead of
+the ~20 minutes a naive single-stage build takes recompiling the entire
+dependency tree from scratch every time. The cache mounts persist on the
+BuildKit builder instance (e.g. a `docker buildx create --driver
+docker-container` builder), not in the exported image, so reuse the same
+builder across builds to keep the cache warm:
+
+```bash
+docker buildx build --platform linux/amd64 -f Dockerfile.registry-server \
+  -t <registry>/nebula/nebula-registry-server:<unique-tag> --push .
+```
+
+Use a unique tag per build (not a floating tag like `nebula`) when the
+deployment's `imagePullPolicy` is `IfNotPresent` — otherwise the running pod
+won't notice a new image exists under the same tag, and `kubectl rollout
+restart` alone won't pull it.
+
 ## Local Development Startup
 
 ```bash
@@ -211,7 +233,7 @@ store, and signed outbound webhook targets. The admin webhook APIs use
 sha256:<digest>` headers. Configure a default signing secret with
 `NEBULA_ADMIN_WEBHOOK_SECRET`; individual webhook records can override it.
 
-For Horizon/Lucity, do not point generic registry telemetry at the existing
+For Horizon-hosted registries, do not point generic registry telemetry at the existing
 `POST /webhooks/nebula` endpoint. That Horizon endpoint is a deployment archive
 handoff and triggers `DeployArchive`. If Horizon should receive registry health
 or telemetry events, add a dedicated Horizon conductor endpoint such as
@@ -251,9 +273,84 @@ neb auth logout --registry-url https://registry.example.com
 
 `neb push`, `neb pull`, and registry-backed vector commands load `NEBULA_AUTH_TOKEN` first, then stored credentials for the target registry remote. Credentials use the OS keychain when available. The plaintext fallback is only for explicit local development with `NEBULA_AUTH_PLAINTEXT_STORE=1`, and is written outside `.nebula` with restrictive file permissions.
 
-## Lucity Boundary
+### Deploy Config
 
-Lucity should own:
+Deploy configs tell the registry where to send a deploy-intent webhook for a
+given service (the destination Horizon or another deploy provider registers
+for its target). Horizon registers its own deploy config automatically the
+first time you deploy a Nebula-galaxy-backed service, but it can also be set
+directly:
+
+```bash
+neb galaxy deploy-config set <galaxy> <service-id> \
+  --deploy-url https://example.com/webhooks/nebula \
+  --signing-secret <at-least-16-bytes> \
+  --provider-key horizon
+neb galaxy deploy-config get <galaxy> <service-id>
+neb galaxy deploy-config delete <galaxy> <service-id>
+```
+
+`<galaxy>` accepts either a `repo_...` id or `owner/name`. This requires a
+token with the `nebula.repository:manage_deploy_config` scope — unlike
+`manage_auth` (a Cedar-policy-bypass scope self-issued tokens are
+deliberately barred from holding), `manage_deploy_config` is a narrow,
+self-service-mintable scope:
+
+```bash
+neb auth token create ci --registry-url https://registry.example.com --org org_a --repository repo_a --scope nebula.repository:manage_deploy_config
+```
+
+Holding the right scope isn't sufficient on its own, though: the registry's
+authorization engine fails closed by default (see "Galaxy Policies" below), so
+an explicit allow rule must also exist for the token's actor before
+`deploy-config set` will succeed for anything but a `manage_auth` credential.
+
+### Galaxy Policies
+
+Every registry action (beyond what `manage_auth` bypasses) is gated by an
+actor-authorization policy that fails closed: a token can carry the right
+scope and still get `403 policy denied this registry action` if no rule
+explicitly allows that actor. Manage these rules with:
+
+```bash
+neb galaxy policy grant <galaxy> <actor> --action <action> [--action <action> ...] [--priority N] [--reason TEXT] [--token <token-id>]
+neb galaxy policy list <galaxy>
+neb galaxy policy revoke <galaxy> <policy-id>
+```
+
+`<actor>` is `public`, or `<kind>:<id>` where kind is `user`, `team`, `agent`,
+or `integration`. `public` matches any authenticated actor — use a specific
+actor in production; it's mainly useful for testing. `<action>` matches the
+`--scope` action names used elsewhere (e.g. `manage_deploy_config`,
+`sync_objects`). All three subcommands require `nebula.repository:manage_auth`
+— granting/listing/revoking access for other actors is an admin operation.
+
+Example: let a CI token actually use a `manage_deploy_config` scope it was
+issued:
+
+```bash
+neb galaxy policy grant repo_abc123 integration:ci-deploy-bot --action manage_deploy_config
+```
+
+Because Better Auth API keys all resolve to the owning account's
+`user:<id>` actor (there's no separate `integration:<name>` identity per
+key), a `user:<id>` grant applies to every token and session that account
+holds — you can't distinguish "this one CI key" from the rest of the
+account's credentials by actor alone. Pass `--token <token-id>` (the
+`tok_...` id from `neb auth token list` or `neb auth whoami`) to scope a
+grant to one specific token in addition to its actor:
+
+```bash
+neb galaxy policy grant repo_abc123 user:usr_owner --action manage_deploy_config --token tok_ci_key_abc
+```
+
+This is additive, not a replacement for actor-based grants: omit `--token`
+for the previous account-wide behavior. `neb galaxy policy list` shows the
+bound `token=...` next to any rule that carries one.
+
+## Horizon Boundary
+
+Horizon owns:
 
 - TLS and ingress routing.
 - Kubernetes/service deployment.
@@ -310,6 +407,23 @@ After deploying the registry service on Horizon:
 Back up Postgres and object storage together. Postgres owns object metadata and
 Nebula protocol records; object storage owns source bytes/chunks and projection
 bundles.
+
+### File → durable import
+
+When migrating a legacy `NEBULA_REGISTRY_BACKEND=file` deployment:
+
+```bash
+export DATABASE_URL=postgres://...
+export BLOB_STORE_URL=s3://bucket/prefix   # or file:///data/blob-store
+neb ops registry import-file \
+  --source /data/registry.json \
+  --source-blob-store /data/blob-store \
+  --run-migrations
+```
+
+Use `--dry-run` first to count repositories, OCI manifests/tags, and blob uploads.
+After import, start the registry **without** `NEBULA_REGISTRY_PERSISTENCE_PATH`
+so Postgres + object store are the only source of truth.
 
 Nebula currently emits backup and restore plans/reports for external tools. It does not provide a complete production backup engine.
 

@@ -13,7 +13,7 @@ Astracollab should expose:
 - Diff viewer backed by changesets and merge plans.
 - Proposal review with comments, checks, approvals, requested changes, and merge gates.
 - Policy editor for actors, environments, integrations, and paths.
-- Integration management for GitHub, Vercel, Lucity, CI, and vector workers.
+- Integration management for GitHub, Vercel, Horizon, CI, and vector workers.
 - Audit views for auth decisions, policy decisions, registry writes, sync sessions, and exports.
 - Search UI combining exact text, symbol, and vector retrieval.
 
@@ -43,6 +43,6 @@ Back up Postgres and object storage together. Rollbacks should be migration-awar
 ## Metrics
 
 The registry exposes a simple Prometheus-compatible `/metrics` endpoint. Hosted
-platforms should scrape it and enrich metrics with Lucity/Kubernetes metadata.
+platforms should scrape it and enrich metrics with Horizon/Kubernetes metadata.
 Detailed per-actor quotas should be tracked at the auth/policy layer and stored
 as audit events.
